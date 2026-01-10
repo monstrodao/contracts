@@ -6,8 +6,8 @@ The contracts defined here govern the core on-chain mechanics of the MONSTRO eco
 
 ## Repository Structure
 
-token/ # Protocol token contracts
-staking/ # Staking and reward distribution contracts
+- `token/` — Protocol token contracts  
+- `staking/` — Staking and reward distribution contracts  
 
 Additional modules, interfaces, and utilities may be added as the protocol evolves.
 
