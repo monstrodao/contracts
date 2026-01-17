@@ -333,6 +333,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         
         uint256 amount = withdrawAmount == 0 ? userStake.amount : withdrawAmount;
         require(amount > 0 && amount <= userStake.amount, "Invalid amount");
+        require(amount == userStake.amount || amount >= MIN_STAKE, "Min withdrawal 1 token unless full");
 
         _processRewardClaim(msg.sender, userStake.amount);
         
