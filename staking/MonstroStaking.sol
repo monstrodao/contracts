@@ -790,49 +790,51 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         uint256 amount12Month,
         bytes32[] calldata proof12Month
     ) external view returns (bool canClaim, string memory reason) {
-        // Check if already claimed
-        if (claimed6Month[user] || claimed12Month[user]) {
+        // Check if BOTH already claimed
+        if (claimed6Month[user] && claimed12Month[user]) {
             return (false, "Already claimed");
         }
-        
-        uint256 expiryTime6Month = merkleExpiry6Month;
-        uint256 expiryTime12Month = merkleExpiry12Month;
-        if (block.timestamp >= expiryTime6Month && block.timestamp >= expiryTime12Month) {
-            return (false, "All allocations expired");
+
+        // Check if both pools are expired
+        if (block.timestamp >= merkleExpiry6Month && block.timestamp >= merkleExpiry12Month) {
+            return (false, "Both allocation pools expired");
         }
-        
+
         // Check if paused
         if (paused) {
-            return (false, "Contract paused");
+            return (false, "Contract is paused");
         }
-        
-        bytes32 leaf6Month = keccak256(bytes.concat(keccak256(abi.encode(user, amount6Month, false))));
-        bytes32 leaf12Month = keccak256(bytes.concat(keccak256(abi.encode(user, amount12Month, true))));
-        
-        if (amount6Month > 0 && block.timestamp < expiryTime6Month && !claimed6Month[user]) {
-            if (!MerkleProof.verify(proof6Month, merkleRoot6Month, leaf6Month)) {
-                return (false, "Invalid merkle proof for 6-month allocation");
+
+        bool hasValidAllocation = false;
+
+        // Validate 6-month allocation if provided and not expired and not already claimed
+        if (amount6Month > 0 && block.timestamp < merkleExpiry6Month && !claimed6Month[user]) {
+            bytes32 leaf6 = keccak256(bytes.concat(keccak256(abi.encode(user, amount6Month))));
+            if (!MerkleProof.verify(proof6Month, merkleRoot6Month, leaf6)) {
+                return (false, "Invalid 6-month merkle proof");
             }
-            
-            // Check pool availability
-            uint256 poolAmount6Month = unassigned6MonthPool;
-            if (poolAmount6Month < amount6Month) {
-                return (false, "6-month pool depleted");
+            if (amount6Month > unassigned6MonthPool) {
+                return (false, "Insufficient 6-month pool");
             }
+            hasValidAllocation = true;
         }
-        
-        if (amount12Month > 0 && block.timestamp < expiryTime12Month && !claimed12Month[user]) {
-            if (!MerkleProof.verify(proof12Month, merkleRoot12Month, leaf12Month)) {
-                return (false, "Invalid merkle proof for 12-month allocation");
+
+        // Validate 12-month allocation if provided and not expired and not already claimed
+        if (amount12Month > 0 && block.timestamp < merkleExpiry12Month && !claimed12Month[user]) {
+            bytes32 leaf12 = keccak256(bytes.concat(keccak256(abi.encode(user, amount12Month))));
+            if (!MerkleProof.verify(proof12Month, merkleRoot12Month, leaf12)) {
+                return (false, "Invalid 12-month merkle proof");
             }
-            
-            // Check pool availability
-            uint256 poolAmount12Month = unassigned12MonthPool;
-            if (poolAmount12Month < amount12Month) {
-                return (false, "12-month pool depleted");
+            if (amount12Month > unassigned12MonthPool) {
+                return (false, "Insufficient 12-month pool");
             }
+            hasValidAllocation = true;
         }
-        
+
+        if (!hasValidAllocation) {
+            return (false, "No valid allocation available");
+        }
+
         return (true, "");
     }
     
