@@ -189,11 +189,11 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
     }
 
     modifier updateReward(address account) {
-        uint256 oldRewardPerToken = rewardPerTokenStored;  // <CHANGE> Store old value
+        uint256 oldRewardPerToken = rewardPerTokenStored;
         rewardPerTokenStored = rewardPerToken();
         lastUpdateTime = block.timestamp;
         
-        // <CHANGE> Track newly allocated rewards globally
+        // Track newly allocated rewards globally
         if (totalStaked > 0) {
             uint256 newlyAllocated = ((rewardPerTokenStored - oldRewardPerToken) * totalStaked) / 1e18;
             allocatedRewards += newlyAllocated;
@@ -665,10 +665,10 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         if (elapsed >= PENALTY_PERIOD) {
             return (0, withdrawAmount, 0);
         }
-        
+
         uint256 remainingTime = PENALTY_PERIOD - elapsed;
         penaltyBps = (MAX_PENALTY_BPS * remainingTime) / PENALTY_PERIOD;
-        penaltyAmount = (withdrawAmount * penaltyBps) / BPS_DENOMINATOR;
+        penaltyAmount = calculatePenalty(user, withdrawAmount);
         afterPenaltyAmount = withdrawAmount - penaltyAmount;
     }
     
