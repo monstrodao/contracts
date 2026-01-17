@@ -80,6 +80,9 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
     uint256 public unassigned6MonthPool;
     uint256 public unassigned12MonthPool;
     uint256 public expiredAllocationsPool;
+
+    // Track rewards allocated but not yet claimed
+    uint256 public allocatedRewards;
     
     // Pending treasury payments mapping for pull pattern
     mapping(address => uint256) public pendingTreasuryPayments;
@@ -184,10 +187,17 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         require(!paused, "Contract is paused");
         _;
     }
-    
+
     modifier updateReward(address account) {
+        uint256 oldRewardPerToken = rewardPerTokenStored;  // <CHANGE> Store old value
         rewardPerTokenStored = rewardPerToken();
         lastUpdateTime = block.timestamp;
+        
+        // <CHANGE> Track newly allocated rewards globally
+        if (totalStaked > 0) {
+            uint256 newlyAllocated = ((rewardPerTokenStored - oldRewardPerToken) * totalStaked) / 1e18;
+            allocatedRewards += newlyAllocated;
+        }
         
         if (account != address(0)) {
             StakeInfo storage userStake = stakes[account];
@@ -198,7 +208,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         }
         _;
     }
-    
+
     // =============================================================
     //                      STAKING FUNCTIONS
     // =============================================================
@@ -553,14 +563,15 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         if (totalStaked == 0) {
             return rewardPerTokenStored;
         }
-        
+
         uint256 timeSinceLastUpdate = block.timestamp - lastUpdateTime;
         uint256 newRewards = timeSinceLastUpdate * emissionsPerSecond;
-        
-        // Cap by remaining emissions
-        if (newRewards > remainingEmissions) {
-            newRewards = remainingEmissions;
-        }
+
+        // Cap by AVAILABLE emissions (remaining - already allocated)
+        uint256 availableEmissions = remainingEmissions > allocatedRewards ? remainingEmissions - allocatedRewards : 0;
+        if (newRewards > availableEmissions) {
+            newRewards = availableEmissions;
+        }        
         
         return rewardPerTokenStored + (newRewards * 1e18 / totalStaked);
     }
@@ -1019,6 +1030,12 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         
         require(totalReward > 0, "No emissions available");
         remainingEmissions -= totalReward;
+        // Reduce allocated rewards when claimed (reward is base amount before tier bonus)
+        if (reward <= allocatedRewards) {
+            allocatedRewards -= reward;
+        } else {
+            allocatedRewards = 0;
+        }
         
         monstroToken.safeTransfer(user, totalReward);
         emit RewardsClaimed(user, totalReward);
