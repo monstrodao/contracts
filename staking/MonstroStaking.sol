@@ -222,6 +222,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
             userStake.amount = amount;
             userStake.startTime = block.timestamp;
             userStake.exists = true;
+            userStake.rewardPerTokenPaid = rewardPerTokenStored;
             
             emit Staked(msg.sender, amount, amount);
         } else {
@@ -290,6 +291,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
             userStake.amount = totalClaimAmount;
             userStake.startTime = block.timestamp;
             userStake.exists = true;
+            userStake.rewardPerTokenPaid = rewardPerTokenStored;
             
             emit AutoStakeActivated(msg.sender, totalClaimAmount);
         } else {
@@ -443,6 +445,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
             toStake.amount = amount;
             toStake.startTime = block.timestamp;
             toStake.exists = true;
+            toStake.rewardPerTokenPaid = rewardPerTokenStored;
         } else {
             // Add to existing stake with time-weighted adjustment
             uint256 oldAmount = toStake.amount;
