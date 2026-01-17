@@ -810,7 +810,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
 
         // Validate 6-month allocation if provided and not expired and not already claimed
         if (amount6Month > 0 && block.timestamp < merkleExpiry6Month && !claimed6Month[user]) {
-            bytes32 leaf6 = keccak256(bytes.concat(keccak256(abi.encode(user, amount6Month))));
+            bytes32 leaf6 = keccak256(bytes.concat(keccak256(abi.encode(user, amount6Month, false))));
             if (!MerkleProof.verify(proof6Month, merkleRoot6Month, leaf6)) {
                 return (false, "Invalid 6-month merkle proof");
             }
@@ -822,7 +822,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
 
         // Validate 12-month allocation if provided and not expired and not already claimed
         if (amount12Month > 0 && block.timestamp < merkleExpiry12Month && !claimed12Month[user]) {
-            bytes32 leaf12 = keccak256(bytes.concat(keccak256(abi.encode(user, amount12Month))));
+            bytes32 leaf12 = keccak256(bytes.concat(keccak256(abi.encode(user, amount12Month, true))));
             if (!MerkleProof.verify(proof12Month, merkleRoot12Month, leaf12)) {
                 return (false, "Invalid 12-month merkle proof");
             }
