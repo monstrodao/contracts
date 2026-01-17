@@ -1107,6 +1107,11 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         uint256 _fortressBps,
         uint256 _kingdomBps
     ) external onlyOwner {
+        // Add sanity checks for multiplier bounds
+        require(_vaultBps <= 2500, "Vault max 25%");
+        require(_fortressBps <= 10000, "Fortress max 100%");
+        require(_kingdomBps <= 30000, "Kingdom max 300%");
+        
         vaultMultiplierBps = _vaultBps;
         fortressMultiplierBps = _fortressBps;
         kingdomMultiplierBps = _kingdomBps;
