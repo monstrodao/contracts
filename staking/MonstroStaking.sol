@@ -355,7 +355,7 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
         }
         
         // Transfer tokens
-        IERC20(address(monstroToken)).safeTransfer(msg.sender, amountAfterPenalty);
+        monstroToken.safeTransfer(msg.sender, amountAfterPenalty);
         
         emit Withdrawn(msg.sender, amountAfterPenalty, penalty);
     }
@@ -1157,19 +1157,21 @@ contract MonstroStaking is Ownable, ReentrancyGuard {
      * @dev Automatically calculates withdrawable amount = balance - totalStaked to protect user funds
      */
     function emergencyWithdrawExcess(address to) external onlyOwner {
-        require(to != address(0), "Invalid address");
-        
         uint256 contractBalance = monstroToken.balanceOf(address(this));
-        require(contractBalance > totalStaked, "No excess tokens");
-        
-        uint256 excessAmount = contractBalance - totalStaked;
-        
-        // Cap at remainingEmissions to avoid underflow if excess includes treasury payments
-        uint256 emissionsReduction = excessAmount > remainingEmissions ? remainingEmissions : excessAmount;
-        remainingEmissions -= emissionsReduction;
-        
+
+        uint256 totalLiabilities = totalStaked 
+            + remainingEmissions 
+            + unassigned6MonthPool 
+            + unassigned12MonthPool 
+            + expiredAllocationsPool
+            + pendingTreasuryPayments[daoTreasury];
+
+        require(contractBalance > totalLiabilities, "No excess tokens");
+
+        uint256 excessAmount = contractBalance - totalLiabilities;
+
         monstroToken.safeTransfer(to, excessAmount);
-        
+
         emit EmergencyWithdrawal(to, excessAmount);
     }
     
