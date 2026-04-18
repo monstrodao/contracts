@@ -4,11 +4,12 @@ Canonical smart contracts for the **Monstro DAO LLC** protocol on Base.
 
 ## Repository Structure
 
-| Directory | Contract | Description |
-|---|---|---|
-| `token/` | `MonstroToken.sol` | MONSTRO protocol token (ERC-20) |
-| `staking/` | `MonstroStaking.sol` | Tiered staking with time-weighted rewards and early-exit penalties |
-| `vaults/` | `MonstroUSDC.sol` | ERC-4626 yield-bearing USDC vault (mUSDC) |
+| Directory | Description |
+|---|---|
+| `token/` | MONSTRO protocol token (ERC-20) |
+| `staking/` | Tiered staking with time-weighted rewards and early-exit penalties |
+| `vaults/` | MonstroUSDC (mUSDC) — ERC-4626 yield-bearing USDC vault |
+| `based_loans/` | [Based Loans protocol](based_loans/README.md) — see Based Loans README |
 
 ## Contracts
 
@@ -22,18 +23,12 @@ Staking contract with tiered reward multipliers and configurable penalty curves 
 
 ### MonstroUSDC (mUSDC)
 
-ERC-4626 vault that wraps USDC into mUSDC shares. The exchange rate only increases over time through two mechanisms:
-
-1. **Immutable fees.** A 0.05% mint fee and 0.25% redeem fee stay in the vault on every deposit/withdrawal, increasing the share price for all holders.
-2. **Protocol revenue.** External USDC deposits (e.g., from Based Loans fee distribution) increase totalAssets without minting new shares.
+ERC-4626 vault wrapping USDC into mUSDC shares. The exchange rate increases over time through protocol fees and external revenue flows.
 
 Key properties:
-- Non-upgradeable. No owner, no admin functions, no pause mechanism.
-- Fees are hardcoded constants, not configurable parameters.
-- Constructor seeds 1 USDC to a dead address, mitigating ERC-4626 inflation attacks.
-- Built on OpenZeppelin ERC4626 v5.
-
-mUSDC is the first Monstro DAO LLC primitive. Based Loans is the first integration, using mUSDC to keep idle lender capital productive between loan matches. Future protocols can integrate independently.
+- Non-upgradeable with no admin controls
+- Immutable fee structure
+- Used by Based Loans to keep idle lender capital productive
 
 ## Audits
 
@@ -42,8 +37,9 @@ mUSDC is the first Monstro DAO LLC primitive. Based Loans is the first integrati
 | MonstroToken | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
 | MonstroStaking | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
 | MonstroUSDC | Hashlock | In progress |
+| Based Loans (all contracts) | Hashlock | In progress |
 
-## Deployments (Base Mainnet)
+## Deployments (Base Mainnet, chainId: 8453)
 
 | Contract | Address |
 |---|---|
@@ -53,7 +49,7 @@ mUSDC is the first Monstro DAO LLC primitive. Based Loans is the first integrati
 
 ## Security
 
-The smart contracts in this repository are provided **as-is** without warranty of any kind. Use at your own risk. Monstro DAO LLC and its contributors make no representations regarding the security, correctness, or fitness for any purpose of the code contained herein.
+The smart contracts in this repository are provided **as-is** without warranty of any kind. Use at your own risk. Monstro DAO LLC and its contributors make no representations regarding the security, correctness, or fitness for any purpose of the code contained herein. Users should only interact with verified contract addresses or official frontends.
 
 ## Contributions
 
