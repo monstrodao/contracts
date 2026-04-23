@@ -77,18 +77,35 @@ contract MonstroUSDC is ERC4626 {
         return netAssets.mulDiv(BPS_DENOMINATOR, BPS_DENOMINATOR - REDEEM_FEE_BPS, Math.Rounding.Ceil);
     }
 
+    /// @dev Closed-form gross required to mint exactly `shares` when fee lands in vault
+    ///      before share pricing. Derived from the invariant:
+    ///      shares / (totalSupply + 1) == net / (totalAssets + fee + 1),
+    ///      with net = gross * (BPS - MINT_FEE_BPS) / BPS and fee = gross * MINT_FEE_BPS / BPS.
+    function _mintGross(uint256 shares) private view returns (uint256) {
+        uint256 T = totalAssets();
+        uint256 S = totalSupply();
+        uint256 denom = (S + 1) * (BPS_DENOMINATOR - MINT_FEE_BPS) - shares * MINT_FEE_BPS;
+        return shares.mulDiv((T + 1) * BPS_DENOMINATOR, denom, Math.Rounding.Ceil);
+    }
+
     // --- Preview overrides (fee-aware) ---
 
     /// @notice Preview shares received for depositing `assets` USDC (mint fee deducted).
     function previewDeposit(uint256 assets) public view virtual override returns (uint256) {
-        (uint256 net,) = _deductMintFee(assets);
-        return _convertToShares(net, Math.Rounding.Floor);
+        if (totalSupply() == SEED_AMOUNT) {
+            return _convertToShares(assets, Math.Rounding.Floor);
+        }
+        (uint256 net, uint256 fee) = _deductMintFee(assets);
+        return net.mulDiv(totalSupply() + 1, totalAssets() + fee + 1, Math.Rounding.Floor);
     }
 
     /// @notice Preview USDC required to mint exactly `shares` mUSDC (mint fee added).
     function previewMint(uint256 shares) public view virtual override returns (uint256) {
-        uint256 netAssets = _convertToAssets(shares, Math.Rounding.Ceil);
-        return _grossForMintFee(netAssets);
+        if (shares == 0) return 0;
+        if (totalSupply() == SEED_AMOUNT) {
+            return _convertToAssets(shares, Math.Rounding.Ceil);
+        }
+        return _mintGross(shares);
     }
 
     /// @notice Preview shares burned to withdraw exactly `assets` USDC after redeem fee.
@@ -100,6 +117,9 @@ contract MonstroUSDC is ERC4626 {
     /// @notice Preview USDC received for redeeming `shares` mUSDC (redeem fee deducted).
     function previewRedeem(uint256 shares) public view virtual override returns (uint256) {
         uint256 gross = _convertToAssets(shares, Math.Rounding.Floor);
+        if (totalSupply() <= shares + SEED_AMOUNT) {
+            return gross;
+        }
         (uint256 net,) = _deductRedeemFee(gross);
         return net;
     }
@@ -116,11 +136,23 @@ contract MonstroUSDC is ERC4626 {
             revert ERC4626ExceededMaxDeposit(receiver, assets, maxAssets);
         }
 
-        (uint256 net,) = _deductMintFee(assets);
-        uint256 shares = _convertToShares(net, Math.Rounding.Floor);
-        if (shares == 0) revert ZeroShares();
+        uint256 shares;
+        if (totalSupply() == SEED_AMOUNT) {
+            // Only dead shares present: skip fee so fee is not lost entirely to dead shares.
+            shares = _convertToShares(assets, Math.Rounding.Floor);
+            if (shares == 0) revert ZeroShares();
+            SafeERC20.safeTransferFrom(IERC20(asset()), _msgSender(), address(this), assets);
+        } else {
+            (uint256 net, uint256 fee) = _deductMintFee(assets);
+            if (fee > 0) {
+                // Transfer fee first so it is reflected in totalAssets before pricing shares.
+                SafeERC20.safeTransferFrom(IERC20(asset()), _msgSender(), address(this), fee);
+            }
+            shares = _convertToShares(net, Math.Rounding.Floor);
+            if (shares == 0) revert ZeroShares();
+            SafeERC20.safeTransferFrom(IERC20(asset()), _msgSender(), address(this), net);
+        }
 
-        SafeERC20.safeTransferFrom(IERC20(asset()), _msgSender(), address(this), assets);
         _mint(receiver, shares);
 
         emit Deposit(_msgSender(), receiver, assets, shares);
@@ -139,8 +171,13 @@ contract MonstroUSDC is ERC4626 {
             revert ERC4626ExceededMaxMint(receiver, shares, maxShares);
         }
 
-        uint256 netAssets = _convertToAssets(shares, Math.Rounding.Ceil);
-        uint256 gross = _grossForMintFee(netAssets);
+        uint256 gross;
+        if (totalSupply() == SEED_AMOUNT) {
+            // Only dead shares present: skip fee so fee is not lost entirely to dead shares.
+            gross = _convertToAssets(shares, Math.Rounding.Ceil);
+        } else {
+            gross = _mintGross(shares);
+        }
 
         // Pull ALL gross USDC into vault. Fee portion stays, growing totalAssets.
         SafeERC20.safeTransferFrom(IERC20(asset()), _msgSender(), address(this), gross);
@@ -167,8 +204,16 @@ contract MonstroUSDC is ERC4626 {
             revert ERC4626ExceededMaxWithdraw(_owner, assets, maxAssets);
         }
 
-        uint256 gross = _grossForRedeemFee(assets);
-        uint256 shares = _convertToShares(gross, Math.Rounding.Ceil);
+        // Try the no-fee path first: if burning shares sized to `assets` (no fee) would
+        // leave only dead shares, the fee would be lost entirely to dead shares. Skip it.
+        uint256 sharesNoFee = _convertToShares(assets, Math.Rounding.Ceil);
+        uint256 shares;
+        if (totalSupply() <= sharesNoFee + SEED_AMOUNT) {
+            shares = sharesNoFee;
+        } else {
+            uint256 gross = _grossForRedeemFee(assets);
+            shares = _convertToShares(gross, Math.Rounding.Ceil);
+        }
 
         if (_msgSender() != _owner) {
             _spendAllowance(_owner, _msgSender(), shares);
@@ -198,9 +243,12 @@ contract MonstroUSDC is ERC4626 {
         }
 
         uint256 gross = _convertToAssets(shares, Math.Rounding.Floor);
+        // Last live redeemer (leaves only dead shares) pays no fee; align return with payout.
+        bool skipFee = totalSupply() <= shares + SEED_AMOUNT;
 
         _withdrawWithFee(_msgSender(), receiver, _owner, gross, shares);
 
+        if (skipFee) return gross;
         (uint256 net,) = _deductRedeemFee(gross);
         return net;
     }
@@ -222,13 +270,28 @@ contract MonstroUSDC is ERC4626 {
 
         _burn(_owner, shares);
 
-        (uint256 net,) = _deductRedeemFee(grossAssets);
-        SafeERC20.safeTransfer(IERC20(asset()), receiver, net);
+        // If only dead shares remain, skip fee: there is no holder left to benefit from it.
+        uint256 payout;
+        if (totalSupply() <= SEED_AMOUNT) {
+            payout = grossAssets;
+        } else {
+            (payout,) = _deductRedeemFee(grossAssets);
+        }
+        SafeERC20.safeTransfer(IERC20(asset()), receiver, payout);
 
-        emit Withdraw(caller, receiver, _owner, net, shares);
+        emit Withdraw(caller, receiver, _owner, payout, shares);
     }
 
     // --- Max functions (fee-aware) ---
+
+    /// @notice Maximum shares that can be minted in a single call without overflow.
+    /// @dev The closed-form `_mintGross` performs `shares * (totalAssets() + 1) * BPS_DENOMINATOR`;
+    ///      we return a ceiling that keeps that product within uint256.
+    function maxMint(address) public view virtual override returns (uint256) {
+        uint256 T = totalAssets();
+        if (T == 0) return 0;
+        return type(uint256).max / (BPS_DENOMINATOR * (T + 1));
+    }
 
     /// @notice Maximum USDC withdrawable by owner (net after redeem fee).
     /// @dev Verifies the round-trip: withdraw(maxWithdraw(owner)) must not require more
