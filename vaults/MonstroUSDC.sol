@@ -88,6 +88,19 @@ contract MonstroUSDC is ERC4626 {
         return shares.mulDiv((T + 1) * BPS_DENOMINATOR, denom, Math.Rounding.Ceil);
     }
 
+    /// @dev Shares required to withdraw exactly `assets` USDC, honoring the last-redeemer
+    ///      skip-fee rule. If burning `sharesWithFee` would leave only dead shares, the fee
+    ///      would be lost entirely to dead shares; in that case we burn `sharesNoFee` instead.
+    function _sharesForWithdraw(uint256 assets) internal view returns (uint256) {
+        uint256 sharesNoFee = _convertToShares(assets, Math.Rounding.Ceil);
+        uint256 gross = _grossForRedeemFee(assets);
+        uint256 sharesWithFee = _convertToShares(gross, Math.Rounding.Ceil);
+        if (totalSupply() <= sharesWithFee + SEED_AMOUNT) {
+            return sharesNoFee;
+        }
+        return sharesWithFee;
+    }
+
     // --- Preview overrides (fee-aware) ---
 
     /// @notice Preview shares received for depositing `assets` USDC (mint fee deducted).
@@ -109,9 +122,9 @@ contract MonstroUSDC is ERC4626 {
     }
 
     /// @notice Preview shares burned to withdraw exactly `assets` USDC after redeem fee.
+    /// @dev Matches withdraw() exactly: last live redeemer (leaves only dead shares) pays no fee.
     function previewWithdraw(uint256 assets) public view virtual override returns (uint256) {
-        uint256 gross = _grossForRedeemFee(assets);
-        return _convertToShares(gross, Math.Rounding.Ceil);
+        return _sharesForWithdraw(assets);
     }
 
     /// @notice Preview USDC received for redeeming `shares` mUSDC (redeem fee deducted).
@@ -204,16 +217,10 @@ contract MonstroUSDC is ERC4626 {
             revert ERC4626ExceededMaxWithdraw(_owner, assets, maxAssets);
         }
 
-        // Try the no-fee path first: if burning shares sized to `assets` (no fee) would
-        // leave only dead shares, the fee would be lost entirely to dead shares. Skip it.
-        uint256 sharesNoFee = _convertToShares(assets, Math.Rounding.Ceil);
-        uint256 shares;
-        if (totalSupply() <= sharesNoFee + SEED_AMOUNT) {
-            shares = sharesNoFee;
-        } else {
-            uint256 gross = _grossForRedeemFee(assets);
-            shares = _convertToShares(gross, Math.Rounding.Ceil);
-        }
+        // If burning the fee-path shares would leave only dead shares, the fee would be
+        // lost entirely to dead shares; _sharesForWithdraw returns the no-fee share count
+        // in that case so the last live redeemer does not pay a fee.
+        uint256 shares = _sharesForWithdraw(assets);
 
         if (_msgSender() != _owner) {
             _spendAllowance(_owner, _msgSender(), shares);
@@ -284,27 +291,52 @@ contract MonstroUSDC is ERC4626 {
 
     // --- Max functions (fee-aware) ---
 
-    /// @notice Maximum shares that can be minted in a single call without overflow.
-    /// @dev The closed-form `_mintGross` performs `shares * (totalAssets() + 1) * BPS_DENOMINATOR`;
-    ///      we return a ceiling that keeps that product within uint256.
+    /// @notice Maximum shares that can be minted in a single call without reverting.
+    /// @dev `_mintGross` has two failure modes we must avoid:
+    ///      1. Overflow in `shares * (totalAssets() + 1) * BPS_DENOMINATOR`.
+    ///      2. Underflow in `(S+1)*(BPS - MINT_FEE_BPS) - shares*MINT_FEE_BPS` when
+    ///         `shares * MINT_FEE_BPS > (S+1) * (BPS - MINT_FEE_BPS)`.
+    ///      In the seed-only state, mint() uses _convertToAssets() not _mintGross(), so the
+    ///      underflow bound does not apply; only the overflow bound constrains the result.
     function maxMint(address) public view virtual override returns (uint256) {
         uint256 T = totalAssets();
         if (T == 0) return 0;
-        return type(uint256).max / (BPS_DENOMINATOR * (T + 1));
+
+        uint256 overflowBound = type(uint256).max / (BPS_DENOMINATOR * (T + 1));
+
+        // In seed-only state, mint() uses _convertToAssets() not _mintGross(),
+        // so the _mintGross denominator underflow bound does not apply.
+        if (totalSupply() == SEED_AMOUNT) {
+            return overflowBound;
+        }
+
+        uint256 underflowBound = (totalSupply() + 1).mulDiv(
+            BPS_DENOMINATOR - MINT_FEE_BPS,
+            MINT_FEE_BPS,
+            Math.Rounding.Floor
+        );
+
+        uint256 cap = overflowBound < underflowBound ? overflowBound : underflowBound;
+        return cap == 0 ? 0 : cap - 1;
     }
 
-    /// @notice Maximum USDC withdrawable by owner (net after redeem fee).
-    /// @dev Verifies the round-trip: withdraw(maxWithdraw(owner)) must not require more
-    ///      shares than the owner holds. Decrements by 1 if ceiling rounding would overflow.
+    /// @notice Maximum USDC withdrawable by owner.
+    /// @dev Last live redeemer (owner holds all non-dead supply) pays no fee, so we return
+    ///      gross. Otherwise, return a net amount whose round-trip through previewWithdraw
+    ///      fits within owner balance.
     function maxWithdraw(address _owner) public view virtual override returns (uint256) {
         uint256 ownerBal = balanceOf(_owner);
         if (ownerBal == 0) return 0;
+
+        // Last live redeemer: burning all owner shares leaves only dead shares, so no fee.
+        if (totalSupply() <= ownerBal + SEED_AMOUNT) {
+            return _convertToAssets(ownerBal, Math.Rounding.Floor);
+        }
+
         uint256 gross = _convertToAssets(ownerBal, Math.Rounding.Floor);
         (uint256 net,) = _deductRedeemFee(gross);
         for (uint256 i; i < 8 && net > 0; i++) {
-            uint256 grossCheck = _grossForRedeemFee(net);
-            uint256 sharesNeeded = _convertToShares(grossCheck, Math.Rounding.Ceil);
-            if (sharesNeeded <= ownerBal) break;
+            if (previewWithdraw(net) <= ownerBal) break;
             net -= 1;
         }
         return net;
