@@ -89,13 +89,20 @@ contract MonstroUSDC is ERC4626 {
     }
 
     /// @dev Shares required to withdraw exactly `assets` USDC, honoring the last-redeemer
-    ///      skip-fee rule. If burning `sharesWithFee` would leave only dead shares, the fee
+    ///      skip-fee rule. If burning `sharesNoFee` would leave only dead shares, the fee
     ///      would be lost entirely to dead shares; in that case we burn `sharesNoFee` instead.
+    ///
+    ///      The LLR condition uses `sharesNoFee` (not `sharesWithFee`) because that is the
+    ///      quantity actually burned on the no-fee path. Using `sharesWithFee` here created a
+    ///      dead zone where previewWithdraw() claimed no fee was needed, but redeem() applied it
+    ///      because the post-burn supply still exceeded SEED_AMOUNT. This made
+    ///      previewWithdraw(X) and redeem(previewWithdraw(X)) inconsistent for any X in the
+    ///      range (balance*0.9975, balance).
     function _sharesForWithdraw(uint256 assets) internal view returns (uint256) {
         uint256 sharesNoFee = _convertToShares(assets, Math.Rounding.Ceil);
         uint256 gross = _grossForRedeemFee(assets);
         uint256 sharesWithFee = _convertToShares(gross, Math.Rounding.Ceil);
-        if (totalSupply() <= sharesWithFee + SEED_AMOUNT) {
+        if (totalSupply() <= sharesNoFee + SEED_AMOUNT) {
             return sharesNoFee;
         }
         return sharesWithFee;
@@ -201,7 +208,13 @@ contract MonstroUSDC is ERC4626 {
         return gross;
     }
 
-    /// @notice Withdraw exact USDC. Burns enough shares to cover gross (including redeem fee).
+    /// @notice Withdraw exact USDC. Burns shares according to fee and LLR rules.
+    /// @dev When the owner holds all non-dead supply (last live redeemer), the redeem fee
+    ///      would flow entirely to dead shares with no benefit to any living holder. In that
+    ///      case the fee is waived for ALL amounts ≤ maxWithdraw (not just the final full
+    ///      redemption). This ensures withdraw(amount) is executable for every
+    ///      amount ≤ maxWithdraw, satisfying the ERC-4626 invariant. For non-LLR owners the
+    ///      fee-inclusive path (_sharesForWithdraw) is used as normal.
     /// @param assets Exact USDC to deliver to receiver.
     /// @param receiver Address receiving the USDC.
     /// @param _owner Address whose shares are burned.
@@ -217,10 +230,13 @@ contract MonstroUSDC is ERC4626 {
             revert ERC4626ExceededMaxWithdraw(_owner, assets, maxAssets);
         }
 
-        // If burning the fee-path shares would leave only dead shares, the fee would be
-        // lost entirely to dead shares; _sharesForWithdraw returns the no-fee share count
-        // in that case so the last live redeemer does not pay a fee.
-        uint256 shares = _sharesForWithdraw(assets);
+        uint256 shares;
+        if (totalSupply() <= balanceOf(_owner) + SEED_AMOUNT) {
+            // Owner is the last live redeemer: fee goes to dead shares only, so waive it.
+            shares = _convertToShares(assets, Math.Rounding.Ceil);
+        } else {
+            shares = _sharesForWithdraw(assets);
+        }
 
         if (_msgSender() != _owner) {
             _spendAllowance(_owner, _msgSender(), shares);
@@ -231,6 +247,17 @@ contract MonstroUSDC is ERC4626 {
         emit Withdraw(_msgSender(), receiver, _owner, assets, shares);
 
         return shares;
+    }
+
+    /// @notice Owner-aware preview of shares that withdraw(assets, *, owner) would burn.
+    /// @dev Unlike previewWithdraw, this accounts for the owner's LLR status. Use this
+    ///      when computing the exact share count for a known owner's withdrawal (e.g. to
+    ///      lock the correct share count at loan origination in LendingLedger).
+    function previewWithdrawFrom(address owner, uint256 assets) public view returns (uint256) {
+        if (totalSupply() <= balanceOf(owner) + SEED_AMOUNT) {
+            return _convertToShares(assets, Math.Rounding.Ceil);
+        }
+        return _sharesForWithdraw(assets);
     }
 
     /// @notice Redeem mUSDC shares for USDC. Redeem fee deducted from output.
