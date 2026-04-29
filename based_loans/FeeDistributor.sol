@@ -5,10 +5,6 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-interface IAutoExecutable {
-    function executeBurns() external;
-}
-
 /// @title BasedLoansFeeDistributor
 /// @notice Three-tier fee splitting. Tier 1 and tier 2 each route to a fixed recipient;
 ///         tier 3 supports per-asset sub-recipients. Fees accumulate into unclaimed balances
@@ -54,6 +50,9 @@ contract BasedLoansFeeDistributor is Ownable {
     // 3-tier config (global)
     uint16 public tier1Bps;
     uint16 public tier2Bps;
+    /// @dev tier3Bps is validated as part of the configured split (tier1 + tier2 + tier3 must equal 10000).
+    ///      The runtime tier3 allocation is calculated as the remainder after tier1 and tier2 so that
+    ///      integer-division rounding dust is retained in tier3 rather than lost.
     uint16 public tier3Bps;
     address public tier2Recipient;
 
@@ -253,12 +252,6 @@ contract BasedLoansFeeDistributor is Ownable {
 
         unclaimedBalances[msg.sender] = 0;
         USDC.safeTransfer(msg.sender, amount);
-
-        // Auto-trigger burns when tier 2 (AutoBurnSplitter) claims its USDC.
-        // Code-size check ensures no revert on EOA; try/catch handles contract failures.
-        if (msg.sender == tier2Recipient && msg.sender.code.length > 0) {
-            try IAutoExecutable(msg.sender).executeBurns() {} catch {}
-        }
 
         emit Claimed(msg.sender, amount);
     }

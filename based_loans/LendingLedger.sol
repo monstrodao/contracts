@@ -6,6 +6,13 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
+/// @dev Extension interface for fee-bearing vaults (e.g. mUSDC) that expose an owner-aware
+///      withdrawal preview. previewWithdrawFrom(owner, assets) returns the exact share count
+///      that withdraw(assets, *, owner) will burn, accounting for the owner's LLR status.
+interface IOwnerPreviewVault {
+    function previewWithdrawFrom(address owner, uint256 assets) external view returns (uint256);
+}
+
 /// @title BasedLoansLendingLedger
 /// @notice Manages lender USDC deposits, per-asset allocation caps, FIFO liquidity queues,
 ///         and per-loan proceeds from collateral buybacks.
@@ -28,8 +35,8 @@ import "@openzeppelin/contracts/interfaces/IERC4626.sol";
 ///      - A lender who is partially filled (loan satisfied before their cap is exhausted) remains
 ///        at the head of the queue with their remaining capacity intact.
 ///      - A lender who is fully drained, or who has no available funds at processing time,
-///        is dequeued lazily. They re-enter automatically via redeployLoanProceeds(), or manually
-///        via updateCap().
+///        is dequeued lazily. They re-enter automatically when their lock is released via
+///        settleBuybackForLender, writeOffPosition, or redeployLoanProceeds.
 ///
 ///      Asset configuration:
 ///      - Each lender may configure at most MAX_CONFIGURED_ASSETS (50) distinct assets.
@@ -60,6 +67,8 @@ contract BasedLoansLendingLedger is Ownable {
     error VaultMaxWithdrawExceeded();
     error CoreAlreadyAuthorized();
     error CoreNotAuthorized();
+    error ShareAccountingInvariantBroken();
+    error NoPendingPayment();
 
     // =============================================================
     //                             STRUCTS
@@ -71,8 +80,8 @@ contract BasedLoansLendingLedger is Ownable {
     }
 
     struct AssetCap {
-        uint256 maxCap;   // Maximum USDC the lender will allocate to this asset (stays USDC)
-        uint256 utilized; // mUSDC shares currently locked for this asset
+        uint256 maxCap;   // Maximum USDC the lender will allocate to this asset
+        uint256 utilized; // USDC currently locked for this asset (was shares; tracks USDC directly to prevent drift with vault PPS)
     }
 
     struct Queue {
@@ -117,11 +126,20 @@ contract BasedLoansLendingLedger is Ownable {
     ///         (authorize, remove, unpause, vault config, parameter updates) are not delegated.
     address public operator;
 
-    /// @notice Sum of all lender globalDeposit values in mUSDC shares. Updated on deposit, withdraw, disburseLoan, settleBuybackForLender, writeOff, and redeploy.
+    /// @notice Sum of all lender globalDeposit values in mUSDC shares. Updated on deposit, withdraw, settleBuybackForLender, writeOff, and redeploy.
+    ///         disburseLoan does NOT modify this value — locked shares (previewWithdraw) exactly equal
+    ///         shares burned, so no global adjustment is needed and sum(globalDeposit) == totalDeposited throughout.
     uint256 public totalDeposited;
 
-    /// @notice Sum of all lender globalLocked values in mUSDC shares. Updated on requestLiquidity, releaseLiquidity, settleBuybackForLender, and writeOff.
+    /// @notice Sum of all lender globalLocked values in mUSDC shares. Updated on requestLiquidity, settleBuybackForLender, writeOffPosition, and writeOff.
     uint256 public totalLocked;
+
+    /// @notice Sum of all per-lender per-asset cap utilization in USDC. Mirrors the aggregate of
+    ///         _caps[lender][asset].utilized across all active loans. Used by display getters so
+    ///         locked loan value is reported as USDC principal exposure rather than converting
+    ///         already-redeemed shares at the current vault exchange rate (which inflates when
+    ///         most shares have been disbursed and vault PPS spikes from protocol fee donations).
+    uint256 public totalUtilizedUsdc;
 
     /// @notice ERC-4626 vault for auto-wrapping idle USDC to mUSDC. address(0) = disabled.
     address public vault;
@@ -156,13 +174,30 @@ contract BasedLoansLendingLedger is Ownable {
     ///         Cleared to zero on writeOff (full default) or when all partials complete.
     mapping(address => mapping(uint256 => mapping(address => uint256))) private _loanSharesRemaining;
 
+    /// @notice Remaining USDC cap exposure per-loan-per-lender. Decremented proportionally on each
+    ///         partial settlement; cleared to zero on final settlement or writeOff.
+    ///         Prevents cap utilization from over-releasing when Core passes principal = funded on final.
+    mapping(address => mapping(uint256 => mapping(address => uint256))) private _loanUsdcRemaining;
+
     /// @notice Per-lender auto-redeploy setting. When true (default), buyback principal returns
     ///         to idle deposit balance (available for new loans). When false, principal goes to
     ///         loanProceeds for manual claim, giving the lender full control over their funds.
     mapping(address => bool) private _autoRedeployDisabled;
 
-    /// @notice Per-lender withdrawal token preference. When true, withdrawals default to mUSDC.
+    /// @notice Per-lender withdrawal token preference. Stored on-chain so the frontend can read
+    ///         it back and route withdrawals/claims accordingly (ClaimDrawer, WithdrawDrawer,
+    ///         SettingsDrawer). The preference is not enforced internally — callers choose the
+    ///         withdrawal path (withdraw vs withdrawAsMusdc). Not dead: setter/getter are part
+    ///         of the user-facing settings flow.
     mapping(address => bool) private _preferMusdc;
+
+    /// @dev Pending repayment state set by pullBuybackPayment and consumed by settleBuybackForLender.
+    ///      Keyed by (core, loanId) so concurrent loans on the same core remain isolated.
+    ///      Cleared when the final lender for a payment is settled.
+    mapping(address => mapping(uint256 => uint256)) private _pendingPaymentUsdc;
+    mapping(address => mapping(uint256 => uint256)) private _pendingPaymentShares;
+    mapping(address => mapping(uint256 => uint256)) private _pendingPaymentUsdcAllocated;
+    mapping(address => mapping(uint256 => uint256)) private _pendingPaymentSharesAllocated;
 
     // =============================================================
     //                             EVENTS
@@ -307,9 +342,11 @@ contract BasedLoansLendingLedger is Ownable {
     }
 
     /// @notice Sets the ERC-4626 vault for auto-wrapping idle USDC. address(0) to disable.
-    /// @dev Vault mint and redeem fees are both supported. Redeem fee costs are socialized
-    ///      across all depositors. Vault can only be changed when the ledger has no deposits
-    ///      at all, to prevent misinterpreting existing USDC balances as vault shares or vice versa.
+    /// @dev Vault mint and redeem fees are both supported. Loan disbursement redeem costs are
+    ///      localized to matched lenders by locking previewWithdrawFrom(address(this), amount)
+    ///      shares during requestLiquidity (falls back to previewWithdraw for standard ERC-4626
+    ///      vaults). Vault can only be changed when the ledger has no deposits at all,
+    ///      to prevent misinterpreting existing USDC balances as vault shares or vice versa.
     /// @param _vault Address of the vault contract, or address(0) to disable.
     function setVault(address _vault) external onlyOwner {
         if (totalDeposited > 0) revert InvalidInput(); // Cannot switch vault while deposits exist
@@ -341,12 +378,12 @@ contract BasedLoansLendingLedger is Ownable {
         _accounts[msg.sender].globalDeposit += shares;
         totalDeposited += shares;
 
-        // Re-enqueue for any configured assets the lender was dequeued from
+        // Re-enqueue for configured assets where the lender now has usable capacity.
         address[] storage assets = _lenderAssets[msg.sender];
         uint256 len = assets.length;
         for (uint256 i = 0; i < len; i++) {
             address a = assets[i];
-            if (!isQueued[a][msg.sender]) {
+            if (!isQueued[a][msg.sender] && _hasUsableCapacity(msg.sender, a)) {
                 _enqueue(a, msg.sender);
             }
         }
@@ -380,7 +417,7 @@ contract BasedLoansLendingLedger is Ownable {
             if (newCap != 0) {
                 if (newCap < minAssetCap) revert CapBelowMinimum(newCap, minAssetCap);
                 if (newCap > maxAssetCap) revert CapAboveMaximum(newCap, maxAssetCap);
-                uint256 currentUtilizedUsdc = _sharesToUsdc(_caps[msg.sender][asset].utilized);
+                uint256 currentUtilizedUsdc = _caps[msg.sender][asset].utilized;
                 if (newCap < currentUtilizedUsdc) revert CapBelowUtilized(newCap, currentUtilizedUsdc);
 
                 if (!_lenderAssetConfigured[msg.sender][asset]) {
@@ -391,12 +428,24 @@ contract BasedLoansLendingLedger is Ownable {
 
                 _caps[msg.sender][asset].maxCap = newCap;
 
-                if (!isQueued[asset][msg.sender]) {
+                // Only enqueue if idle liquidity and remaining cap both meet minimum threshold.
+                if (!isQueued[asset][msg.sender] && _hasUsableCapacity(msg.sender, asset)) {
                     _enqueue(asset, msg.sender);
                 }
-            }
 
-            emit CapUpdated(msg.sender, asset, newCap);
+                emit CapUpdated(msg.sender, asset, newCap);
+            } else {
+                // L-05: zero-cap branch — clear maxCap and only remove the asset slot when
+                // no active loan exposure remains. If utilized > 0 the asset must stay in
+                // _lenderAssets so getAccount/getLenderSummary still include the locked value.
+                _caps[msg.sender][asset].maxCap = 0;
+                if (_lenderAssetConfigured[msg.sender][asset]) {
+                    if (_caps[msg.sender][asset].utilized == 0) {
+                        _removeLenderAsset(msg.sender, asset);
+                    }
+                    emit CapUpdated(msg.sender, asset, 0);
+                }
+            }
         }
     }
 
@@ -419,15 +468,15 @@ contract BasedLoansLendingLedger is Ownable {
             sharesToBurn = amount;
             usdcOut = amount;
         } else {
-            IERC4626 v = IERC4626(vault);
-            sharesToBurn = v.previewWithdraw(amount);
-            // Clamp shares to the lender's actual idle balance. Ceiling rounding in
-            // previewWithdraw can request up to 1 wei more than the lender owns.
-            if (sharesToBurn > idleShares) sharesToBurn = idleShares;
-            // Redeem by exact shares so the vault call cannot revert on rounding.
-            // The returned USDC is what the caller actually gets.
-            usdcOut = v.redeem(sharesToBurn, address(this), address(this));
-            if (usdcOut > amount) usdcOut = amount; // never over-deliver
+            // Use withdraw() not redeem(previewWithdraw()): in fee-bearing vaults
+            // redeem(previewWithdraw(X)) can burn a mismatched share amount (dead zone),
+            // stranding USDC in the contract. withdraw() delivers exactly X.
+            sharesToBurn = IERC4626(vault).withdraw(amount, address(this), address(this));
+            // Defensive: the amount guard above (idleUsdc < amount) prevents this, but we
+            // assert it explicitly so any vault miscalculation surfaces immediately rather than
+            // silently draining other lenders' shares.
+            if (sharesToBurn > idleShares) revert ShareAccountingInvariantBroken();
+            usdcOut = amount;
         }
 
         acct.globalDeposit -= sharesToBurn;
@@ -443,17 +492,14 @@ contract BasedLoansLendingLedger is Ownable {
         if (vault == address(0)) revert VaultNotSet();
         Account storage acct = _accounts[msg.sender];
         uint256 idleShares = acct.globalDeposit - acct.globalLocked;
-        uint256 idleUsdc = _sharesToUsdcNet(idleShares);
-        // No vault deliverability cap here — shares are transferred directly
-        // to the lender without vault redemption. Share transfers are always valid
-        // regardless of vault USDC state.
-        if (idleUsdc < amount) revert InsufficientUnlockedBalance();
 
-        // Convert USDC amount to vault shares
+        // Transfers shares directly — no vault redemption occurs.
+        // Check against gross share value, not net redeemable USDC, because no redeem
+        // fee is paid here. Using _sharesToUsdcNet would block withdrawals the lender
+        // is entitled to receive.
         IERC4626 v = IERC4626(vault);
         uint256 shares = v.convertToShares(amount);
-        // Safety clamp: prevent underflow from rounding
-        if (shares > idleShares) shares = idleShares;
+        if (shares > idleShares) revert InsufficientUnlockedBalance();
         acct.globalDeposit -= shares;
         totalDeposited -= shares;
         IERC20(vault).safeTransfer(msg.sender, shares);
@@ -475,15 +521,17 @@ contract BasedLoansLendingLedger is Ownable {
         return !_autoRedeployDisabled[lender];
     }
 
-    /// @notice Sets the lender's preferred withdrawal token. When true, withdrawals and claims
-    ///         default to mUSDC. When false (default), they default to USDC.
+    /// @notice Stores the lender's preferred withdrawal token on-chain.
+    /// @dev Read by the frontend (ClaimDrawer, WithdrawDrawer, SettingsDrawer) to route
+    ///      withdrawals to USDC or mUSDC. The contract does not enforce this preference
+    ///      internally — it is a user-set signal for the UI. Not internally dead.
     /// @param preferMusdc True to prefer mUSDC, false for USDC (default).
     function setWithdrawPreference(bool preferMusdc) external {
         _preferMusdc[msg.sender] = preferMusdc;
         emit WithdrawPreferenceUpdated(msg.sender, preferMusdc);
     }
 
-    /// @notice Returns whether the lender prefers mUSDC for withdrawals (false by default).
+    /// @notice Returns the lender's stored withdrawal preference (false = USDC, true = mUSDC).
     function prefersMusdc(address lender) external view returns (bool) {
         return _preferMusdc[lender];
     }
@@ -507,7 +555,8 @@ contract BasedLoansLendingLedger is Ownable {
             if (newCap != 0) {
                 if (newCap < minAssetCap) revert CapBelowMinimum(newCap, minAssetCap);
                 if (newCap > maxAssetCap) revert CapAboveMaximum(newCap, maxAssetCap);
-                uint256 currentUtilizedUsdc = _sharesToUsdc(_caps[msg.sender][asset].utilized);
+                // utilized is USDC; compare directly without share conversion
+                uint256 currentUtilizedUsdc = _caps[msg.sender][asset].utilized;
                 if (newCap < currentUtilizedUsdc) revert CapBelowUtilized(newCap, currentUtilizedUsdc);
 
                 if (!_lenderAssetConfigured[msg.sender][asset]) {
@@ -518,13 +567,17 @@ contract BasedLoansLendingLedger is Ownable {
 
                 _caps[msg.sender][asset].maxCap = newCap;
 
-                if (!isQueued[asset][msg.sender]) {
+                // Only enqueue if idle liquidity and remaining cap both meet minimum threshold.
+                // Cap setting without deposit is allowed; the separate-tx flow just won't enqueue until funded.
+                if (!isQueued[asset][msg.sender] && _hasUsableCapacity(msg.sender, asset)) {
                     _enqueue(asset, msg.sender);
                 }
             } else {
                 _caps[msg.sender][asset].maxCap = 0;
 
-                if (_lenderAssetConfigured[msg.sender][asset]) {
+                // Only free the slot when no active loan exposure remains; if utilized > 0
+                // the asset must stay in _lenderAssets so getAccount can include the lock.
+                if (_lenderAssetConfigured[msg.sender][asset] && _caps[msg.sender][asset].utilized == 0) {
                     _removeLenderAsset(msg.sender, asset);
                 }
             }
@@ -554,14 +607,14 @@ contract BasedLoansLendingLedger is Ownable {
             }
         }
         if (totalShares == 0) revert NoProceeds();
-        uint256 usdcOut = _sharesToUsdcNet(totalShares);
-        uint256 deliverable = _vaultDeliverable();
-        if (usdcOut > deliverable) usdcOut = deliverable;
-        uint256 sharesBurned = _unwrapFromVault(usdcOut);
-        // Absorb any redeem fee into totalDeposited (socialized)
-        if (sharesBurned > totalShares) {
-            uint256 feeShares = sharesBurned - totalShares;
-            if (feeShares <= totalDeposited) totalDeposited -= feeShares;
+        // Redeem by exact shares so no redeem fee is socialized into totalDeposited.
+        // Proceeds shares live in loanProceeds (not globalDeposit), so the caller bears only
+        // the vault's own redeem fee on their specific proceeds — nothing is mutualized.
+        uint256 usdcOut;
+        if (vault == address(0)) {
+            usdcOut = totalShares;
+        } else {
+            usdcOut = IERC4626(vault).redeem(totalShares, address(this), address(this));
         }
         USDC.safeTransfer(msg.sender, usdcOut);
     }
@@ -593,12 +646,12 @@ contract BasedLoansLendingLedger is Ownable {
         _accounts[msg.sender].globalDeposit += totalShares;
         totalDeposited += totalShares;
 
-        // Re-enqueue for all configured assets
+        // Re-enqueue for configured assets where the lender now has usable capacity.
         address[] storage assets = _lenderAssets[msg.sender];
         uint256 len = assets.length;
         for (uint256 i; i < len; i++) {
             address a = assets[i];
-            if (!isQueued[a][msg.sender]) {
+            if (!isQueued[a][msg.sender] && _hasUsableCapacity(msg.sender, a)) {
                 _enqueue(a, msg.sender);
             }
         }
@@ -630,10 +683,9 @@ contract BasedLoansLendingLedger is Ownable {
         }
         if (totalShares == 0) revert NoProceeds();
 
-        // Convert user's USDC redeploy amount to shares, cap at total available
-        uint256 totalUsdc = _sharesToUsdcNet(totalShares);
-        uint256 toRedeployUsdc = amount < totalUsdc ? amount : totalUsdc;
-        uint256 toRedeployShares = _usdcToShares(toRedeployUsdc);
+        // Keep accounting in shares throughout to avoid net/gross domain mixing.
+        // Convert the user's USDC request to shares (gross) and cap at what we have.
+        uint256 toRedeployShares = _usdcToShares(amount);
         if (toRedeployShares > totalShares) toRedeployShares = totalShares;
         uint256 toWithdrawShares = totalShares - toRedeployShares;
 
@@ -641,30 +693,28 @@ contract BasedLoansLendingLedger is Ownable {
         _accounts[msg.sender].globalDeposit += toRedeployShares;
         totalDeposited += toRedeployShares;
 
-        // Re-enqueue for all configured assets
+        // Re-enqueue for configured assets where the lender now has usable capacity.
         address[] storage assets = _lenderAssets[msg.sender];
         uint256 len = assets.length;
         for (uint256 i; i < len; i++) {
             address a = assets[i];
-            if (!isQueued[a][msg.sender]) {
+            if (!isQueued[a][msg.sender] && _hasUsableCapacity(msg.sender, a)) {
                 _enqueue(a, msg.sender);
             }
         }
 
-        // Withdraw remainder directly to the lender
-        uint256 toWithdrawUsdc = _sharesToUsdcNet(toWithdrawShares);
-        uint256 deliverable = _vaultDeliverable();
-        if (toWithdrawUsdc > deliverable) toWithdrawUsdc = deliverable;
-        if (toWithdrawUsdc > 0) {
-            uint256 sharesBurned = _unwrapFromVault(toWithdrawUsdc);
-            if (sharesBurned > toWithdrawShares) {
-                uint256 feeShares = sharesBurned - toWithdrawShares;
-                if (feeShares <= totalDeposited) totalDeposited -= feeShares;
+        // Withdraw remainder by exact shares; no fee socialization into totalDeposited.
+        uint256 toWithdrawUsdc;
+        if (toWithdrawShares > 0) {
+            if (vault == address(0)) {
+                toWithdrawUsdc = toWithdrawShares;
+            } else {
+                toWithdrawUsdc = IERC4626(vault).redeem(toWithdrawShares, address(this), address(this));
             }
             USDC.safeTransfer(msg.sender, toWithdrawUsdc);
         }
 
-        emit PartialRedeploy(msg.sender, toRedeployUsdc, toWithdrawUsdc);
+        emit PartialRedeploy(msg.sender, _sharesToUsdc(toRedeployShares), toWithdrawUsdc);
     }
 
     // =============================================================
@@ -701,8 +751,8 @@ contract BasedLoansLendingLedger is Ownable {
     {
         _onlyActiveCore();
 
-        // Cap at what the vault can actually deliver (per-lender idle may exceed
-        // vault holdings due to deferred redeem-fee socialization).
+        // Cap at what the vault can actually deliver. Matching uses net withdrawable
+        // liquidity so requestLiquidity never locks more USDC than the vault can fund.
         uint256 deliverable = _vaultDeliverable();
         if (needed > deliverable) needed = deliverable;
 
@@ -714,133 +764,119 @@ contract BasedLoansLendingLedger is Ownable {
         amounts = new uint256[](limit);
         uint256 totalSharesLocked;
 
-        address walkPtr = _assetQueues[asset].head;
-        address newHead = walkPtr;
-        // After any skip (not dequeue), head cannot advance past the skipped lender.
-        bool headAdvances = true;
+        // Traverse with prev/current/next so downstream dequeues reconnect
+        // the linked list even when a head or earlier node was skipped (not dequeued).
+        address prev = address(0);
+        address current = _assetQueues[asset].head;
 
-        while (walkPtr != address(0) && totalFound < needed && foundCount < limit) {
-            uint256 idleUsdc = _sharesToUsdcNet(_accounts[walkPtr].globalDeposit - _accounts[walkPtr].globalLocked);
-            uint256 _maxCap = _caps[walkPtr][asset].maxCap;
-            uint256 capUtilizedUsdc = _sharesToUsdcNet(_caps[walkPtr][asset].utilized);
+        while (current != address(0) && totalFound < needed && foundCount < limit) {
+            address next = nextInLine[asset][current];
+
+            uint256 idleSharesWalk = _accounts[current].globalDeposit - _accounts[current].globalLocked;
+            // Net withdrawable USDC is correct here — we can only match USDC the vault can
+            // actually deliver. Redeem fees are localized to matched lenders via previewWithdraw
+            // share locks, not socialized globally. Using net is intentional.
+            uint256 idleUsdc = _sharesToUsdcNet(idleSharesWalk);
+            uint256 _maxCap = _caps[current][asset].maxCap;
+            // utilized is USDC; compare directly without share conversion.
+            uint256 capUtilizedUsdc = _caps[current][asset].utilized;
             uint256 availAsset = _maxCap > capUtilizedUsdc ? _maxCap - capUtilizedUsdc : 0;
             uint256 canLend = idleUsdc < availAsset ? idleUsdc : availAsset;
 
-            address next = nextInLine[asset][walkPtr];
-
             if (canLend < minAssetCap) {
-                // Below the ledger minimum — dequeue.
-                nextInLine[asset][walkPtr] = address(0);
-                isQueued[asset][walkPtr] = false;
-                walkPtr = next;
-                if (headAdvances) newHead = walkPtr;
+                // Below the ledger minimum — dequeue and reconnect via _unlinkQueued.
+                _unlinkQueued(asset, prev, current, next);
+                current = next;
+                // prev stays unchanged: it still points to the last live node.
             } else if (minFillPerLender > 0 && canLend < minFillPerLender) {
                 // Below this loan's per-lender floor — skip without dequeuing.
-                walkPtr = next;
-                headAdvances = false;
+                prev = current;
+                current = next;
             } else {
                 uint256 stillNeeded = needed - totalFound;
                 uint256 take = canLend < stillNeeded ? canLend : stillNeeded;
 
-                // Convert USDC take to shares for internal storage
-                uint256 takeShares = _usdcToShares(take);
-                _accounts[walkPtr].globalLocked += takeShares;
-                _caps[walkPtr][asset].utilized += takeShares;
-                totalSharesLocked += takeShares;
-                _loanSharesOriginal[msg.sender][loanId][walkPtr] += takeShares;
-                _loanSharesRemaining[msg.sender][loanId][walkPtr] += takeShares;
+                // If the remaining need is below the per-fill minimum, the resulting
+                // lender position would be dust. Stop matching — lender stays queued.
+                if (take < minAssetCap) break;
+                if (minFillPerLender > 0 && take < minFillPerLender) break;
 
-                lenders[foundCount] = walkPtr;
+                // Lock fee-inclusive shares: previewWithdraw(take) == shares that disburseLoan will burn.
+                // Ensures sum(globalDeposit) == totalDeposited throughout the loan lifecycle.
+                // _sharesToUsdcNet(idleSharesWalk) guarantees previewWithdraw(take) <= idleSharesWalk.
+                // If that invariant is ever violated (e.g. future vault with unexpected rounding), the
+                // transaction must revert rather than silently under-lock shares while recording the
+                // full take in amounts[]/totalFound.
+                uint256 takeShares = _usdcToWithdrawShares(take);
+                if (takeShares > idleSharesWalk) revert ShareAccountingInvariantBroken();
+                _accounts[current].globalLocked += takeShares;
+                // Track USDC amount, not shares, so cap utilization doesn't drift with vault appreciation.
+                _caps[current][asset].utilized += take;
+                totalUtilizedUsdc += take;
+                totalSharesLocked += takeShares;
+                _loanSharesOriginal[msg.sender][loanId][current] += takeShares;
+                _loanSharesRemaining[msg.sender][loanId][current] += takeShares;
+                // Track USDC separately from shares for correct cap utilization release.
+                _loanUsdcRemaining[msg.sender][loanId][current] += take;
+
+                lenders[foundCount] = current;
                 amounts[foundCount] = take;
                 totalFound += take;
                 foundCount++;
 
-                emit LiquidityLocked(walkPtr, asset, take);
+                emit LiquidityLocked(current, asset, take);
 
                 if (take == canLend) {
-                    // Fully drained: dequeue and advance
-                    nextInLine[asset][walkPtr] = address(0);
-                    isQueued[asset][walkPtr] = false;
-                    walkPtr = next;
-                    if (headAdvances) newHead = walkPtr;
+                    // Fully drained — dequeue and reconnect. prev stays unchanged.
+                    _unlinkQueued(asset, prev, current, next);
+                    current = next;
+                } else {
+                    // Partially taken because stillNeeded < canLend, so the loan is now satisfied.
+                    // Lender stays in queue. Loop exits on the next iteration's condition check.
+                    prev = current;
+                    current = next;
                 }
-                // else: partially taken, loan now satisfied — lender stays in queue
             }
-        }
-
-        _assetQueues[asset].head = newHead;
-        if (newHead == address(0)) {
-            _assetQueues[asset].tail = address(0);
         }
 
         totalLocked += totalSharesLocked;
     }
 
     /// @notice Transfers USDC out of the ledger to Core for disbursement to a borrower.
-    /// @dev Called by Core immediately after requestLiquidity. No accounting update needed —
-    ///      the locked amount already reflects that these funds are committed to a loan.
+    /// @dev Called by Core immediately after requestLiquidity. No accounting update needed:
+    ///      requestLiquidity locks the shares vault.withdraw(take) will burn (via owner-aware
+    ///      previewWithdrawFrom when available, previewWithdraw otherwise), which exactly equals
+    ///      the shares _unwrapFromVault burns here. Per-lender and global accounting remain
+    ///      consistent — sum(globalDeposit) == totalDeposited is preserved.
     /// @param to Recipient address (Core contract, which then forwards to borrower minus fee).
     /// @param amount USDC amount to transfer out.
     function disburseLoan(address to, uint256 amount) external {
         _onlyActiveCore();
-        uint256 sharesBurned = _unwrapFromVault(amount);
-        // Vault redeem fees are socialized across all depositors. totalDeposited is
-        // reduced to reflect aggregate share loss. Individual lender balances and
-        // locked-share records are NOT adjusted here; loss is realized lazily during
-        // settlement and withdrawals. This is intentional — touching per-lender or
-        // per-loan state at this point risks underflow when settlement later subtracts
-        // the full original locked shares from those same balances.
-        uint256 expectedShares = _usdcToShares(amount);
-        if (sharesBurned > expectedShares) {
-            uint256 feeShares = sharesBurned - expectedShares;
-            if (feeShares <= totalDeposited) totalDeposited -= feeShares;
-        }
+        _unwrapFromVault(amount);
         USDC.safeTransfer(to, amount);
         emit LoanDisbursed(to, amount);
     }
 
-    /// @notice Releases a lender's locked position when their share of a loan is repaid in USDC.
-    /// @dev When auto-redeploy is enabled (default), principal returns to idle deposit balance.
-    ///      When disabled, principal goes to loanProceeds for manual claim, giving the lender
-    ///      full control over their funds before they can be re-matched.
-    /// @param loanId The loan ID being repaid.
-    /// @param lender The lender whose locked balance to release.
-    /// @param asset The collateral asset the liquidity was locked for.
-    /// @param amount The USDC principal amount being released.
-    function releaseLiquidity(uint256 loanId, address lender, address asset, uint256 amount) external {
-        _onlyActiveCore();
-        uint256 remainingShares = _loanSharesRemaining[msg.sender][loanId][lender];
-        uint256 shares = remainingShares > 0 ? remainingShares : _usdcToShares(amount);
-        if (shares > _accounts[lender].globalLocked) shares = _accounts[lender].globalLocked;
-        _loanSharesRemaining[msg.sender][loanId][lender] = 0;
-        uint256 assetShares = shares;
-        if (assetShares > _caps[lender][asset].utilized) assetShares = _caps[lender][asset].utilized;
-
-        _accounts[lender].globalLocked -= shares;
-        _caps[lender][asset].utilized -= assetShares;
-        totalLocked -= shares;
-
-        if (_autoRedeployDisabled[lender]) {
-            // Manual claim mode: move principal out of deposit into proceeds (shares)
-            _accounts[lender].globalDeposit -= shares;
-            totalDeposited -= shares;
-            loanProceeds[msg.sender][loanId][lender] += shares;
-            emit LoanProceedsCredited(loanId, lender, amount);
-        }
-
-        emit LiquidityReleased(lender, asset, amount);
-    }
-
-    /// @notice Settles a lender's buyback payment. Handles both principal unlock and yield based
-    ///         on the lender's auto-redeploy preference.
-    /// @dev Called by Core during buyback. Replaces separate releaseLiquidity + creditLoanProceeds calls.
-    ///      Auto-redeploy ON:  principal unlocks to idle, yield added to idle (all auto-redeployed)
-    ///      Auto-redeploy OFF: principal + yield both go to claimable proceeds
+    /// @notice Settles a lender's buyback payment using the actual vault shares minted by the
+    ///         prior pullBuybackPayment call for this loan. Handles both principal unlock and
+    ///         yield crediting based on the lender's auto-redeploy preference.
+    /// @dev Requires a preceding pullBuybackPayment(from, amount, loanId) call from the same Core.
+    ///      lenderActualShares = pendingShares * totalPayment / pendingUsdc (proportional allocation).
+    ///      The last lender (usdcAllocated + totalPayment == pendingUsdc) receives remaining shares
+    ///      to absorb integer-division rounding. Pending state is deleted on final settlement.
+    ///
+    ///      Lender credits are based on vault-minted shares, not _usdcToShares conversions that
+    ///      ignore mint fees or vault share appreciation.
+    ///
+    ///      Auto-redeploy ON:  principal stays idle; net share delta (actual - locked) applied to deposit.
+    ///                         Positive = yield shares added. Negative = deposit trimmed to vault reality.
+    ///      Auto-redeploy OFF: principalLockedRelease leaves deposit; lenderActualShares go to proceeds.
     /// @param loanId The loan ID being repaid.
     /// @param lender The lender receiving the payment.
     /// @param asset The collateral asset the liquidity was locked for.
-    /// @param principal The USDC principal component of this payment.
+    /// @param principal The USDC principal component of this lender's payment.
     /// @param totalPayment The full USDC payment to this lender (principal + yield).
+    ///                     Sum across all lenders must equal the pullBuybackPayment amount.
     /// @param originalFunded The total USDC originally locked for this lender at loan origination.
     function settleBuybackForLender(
         uint256 loanId,
@@ -852,82 +888,134 @@ contract BasedLoansLendingLedger is Ownable {
     ) external {
         _onlyActiveCore();
 
+        // ── Pending payment guard ────────────────────────────────────────────────
+        uint256 pendingUsdc = _pendingPaymentUsdc[msg.sender][loanId];
+        uint256 pendingShares = _pendingPaymentShares[msg.sender][loanId];
+        if (pendingUsdc == 0) revert NoPendingPayment();
+
+        // ── Allocate this lender's proportional share of actual minted shares ───
+        // Last lender gets remaining shares to absorb integer-division rounding.
+        // Over-allocation (sum of lenderPayments > pendingUsdc) reverts rather than
+        // silently treating the excess as a final settlement.
+        uint256 usdcAllocated = _pendingPaymentUsdcAllocated[msg.sender][loanId];
+        uint256 sharesAllocated = _pendingPaymentSharesAllocated[msg.sender][loanId];
+        uint256 newUsdcAllocated = usdcAllocated + totalPayment;
+        if (newUsdcAllocated > pendingUsdc) revert ShareAccountingInvariantBroken();
+        bool isFinalLender = (newUsdcAllocated == pendingUsdc);
+        uint256 lenderActualShares;
+        if (isFinalLender) {
+            lenderActualShares = pendingShares > sharesAllocated ? pendingShares - sharesAllocated : 0;
+            delete _pendingPaymentUsdc[msg.sender][loanId];
+            delete _pendingPaymentShares[msg.sender][loanId];
+            delete _pendingPaymentUsdcAllocated[msg.sender][loanId];
+            delete _pendingPaymentSharesAllocated[msg.sender][loanId];
+        } else {
+            lenderActualShares = pendingShares * totalPayment / pendingUsdc;
+            if (sharesAllocated + lenderActualShares > pendingShares) revert ShareAccountingInvariantBroken();
+            _pendingPaymentUsdcAllocated[msg.sender][loanId] = newUsdcAllocated;
+            _pendingPaymentSharesAllocated[msg.sender][loanId] = sharesAllocated + lenderActualShares;
+        }
+
+        // ── Principal locked release (lock tracking — unchanged formula) ─────────
+        // Uses original share counts to maintain _loanSharesRemaining, globalLocked, and
+        // cap utilization. Economic credit uses lenderActualShares instead.
         uint256 originalShares = _loanSharesOriginal[msg.sender][loanId][lender];
         uint256 remainingShares = _loanSharesRemaining[msg.sender][loanId][lender];
-        uint256 principalShares;
+        uint256 principalLockedRelease;
         if (originalShares > 0 && originalFunded > 0) {
-            principalShares = originalShares * principal / originalFunded;
-            if (principalShares > remainingShares) principalShares = remainingShares;
-            // Sweep dust on final settlement to prevent rounding residue
-            uint256 afterRelease = remainingShares - principalShares;
-            if (afterRelease > 0 && afterRelease <= _usdcToShares(1e6)) {
-                principalShares = remainingShares;
-            }
+            principalLockedRelease = originalShares * principal / originalFunded;
+            // Do not sweep lender-level dust during partial buybacks.
+            if (principalLockedRelease > remainingShares) principalLockedRelease = remainingShares;
         } else {
-            principalShares = _usdcToShares(principal);
+            principalLockedRelease = remainingShares > 0 ? remainingShares : _usdcToShares(principal);
         }
-        if (principalShares > _accounts[lender].globalLocked) principalShares = _accounts[lender].globalLocked;
-        _loanSharesRemaining[msg.sender][loanId][lender] -= principalShares;
-        uint256 assetShares = principalShares;
-        if (assetShares > _caps[lender][asset].utilized) assetShares = _caps[lender][asset].utilized;
+        if (principalLockedRelease > _accounts[lender].globalLocked) {
+            principalLockedRelease = _accounts[lender].globalLocked;
+        }
 
-        // Unlock principal from locked balances
-        _accounts[lender].globalLocked -= principalShares;
-        _caps[lender][asset].utilized -= assetShares;
-        totalLocked -= principalShares;
+        // ── Release lock tracking ────────────────────────────────────────────────
+        _loanSharesRemaining[msg.sender][loanId][lender] -= principalLockedRelease;
+        // Use per-loan USDC remaining for cap utilization release, not `principal`.
+        // Core passes principal = funded on final buyback to clear share dust — correct for share
+        // accounting but wrong for cap utilization after partial buybacks already decremented it.
+        uint256 remainingUsdc = _loanUsdcRemaining[msg.sender][loanId][lender];
+        uint256 assetRelease;
+        if (principal >= originalFunded) {
+            // Final repayment signal: clear all remaining USDC cap exposure for this loan/lender.
+            assetRelease = remainingUsdc;
+        } else {
+            assetRelease = principal < remainingUsdc ? principal : remainingUsdc;
+        }
+        _loanUsdcRemaining[msg.sender][loanId][lender] = remainingUsdc - assetRelease;
+        if (assetRelease > _caps[lender][asset].utilized) revert ShareAccountingInvariantBroken();
+        _accounts[lender].globalLocked -= principalLockedRelease;
+        _caps[lender][asset].utilized -= assetRelease;
+        totalUtilizedUsdc -= assetRelease;
+        totalLocked -= principalLockedRelease;
+        // If lender opted out (maxCap == 0) and the loan is now fully settled, free the slot.
+        if (_caps[lender][asset].utilized == 0 && _caps[lender][asset].maxCap == 0
+                && _lenderAssetConfigured[lender][asset]) {
+            _removeLenderAsset(lender, asset);
+        }
 
-        uint256 yieldUsdc = totalPayment > principal ? totalPayment - principal : 0;
-        uint256 yieldShares = yieldUsdc > 0 ? _usdcToShares(yieldUsdc) : 0;
-
+        // ── Credit deposit / proceeds with vault-actual shares ────────────────────
         if (_autoRedeployDisabled[lender]) {
-            // Manual mode: everything goes to claimable proceeds
-            // Move principal out of deposit into proceeds
-            _accounts[lender].globalDeposit -= principalShares;
-            totalDeposited -= principalShares;
-            // Credit full payment (principal + yield) as proceeds
-            uint256 totalShares = principalShares + yieldShares;
-            loanProceeds[msg.sender][loanId][lender] += totalShares;
+            // Manual mode: principal portion leaves deposit; actual minted shares go to proceeds.
+            if (principalLockedRelease > _accounts[lender].globalDeposit) revert ShareAccountingInvariantBroken();
+            if (principalLockedRelease > totalDeposited) revert ShareAccountingInvariantBroken();
+            _accounts[lender].globalDeposit -= principalLockedRelease;
+            totalDeposited -= principalLockedRelease;
+            loanProceeds[msg.sender][loanId][lender] += lenderActualShares;
             emit LoanProceedsCredited(loanId, lender, totalPayment);
         } else {
-            // Auto-redeploy: principal stays in idle (already unlocked above).
-            // Yield gets added to deposit balance too (auto-redeployed).
-            if (yieldShares > 0) {
+            // Auto-redeploy: principal stays idle (lock released above). Apply net share delta.
+            if (lenderActualShares >= principalLockedRelease) {
+                // Normal case: yield shares (actual minus locked release) added to deposit.
+                uint256 yieldShares = lenderActualShares - principalLockedRelease;
                 _accounts[lender].globalDeposit += yieldShares;
                 totalDeposited += yieldShares;
+            } else {
+                // Vault appreciated: repayment minted fewer shares than originally locked.
+                // Trim deposit to reflect true vault backing.
+                uint256 delta = principalLockedRelease - lenderActualShares;
+                if (delta > _accounts[lender].globalDeposit) revert ShareAccountingInvariantBroken();
+                if (delta > totalDeposited) revert ShareAccountingInvariantBroken();
+                _accounts[lender].globalDeposit -= delta;
+                totalDeposited -= delta;
+            }
+            // Auto-redeploy settlement restored idle/cap capacity — re-enqueue if eligible.
+            // Manual mode skips this: proceeds are claimable, not automatically lendable.
+            if (!isQueued[asset][lender] && _hasUsableCapacity(lender, asset)) {
+                _enqueue(asset, lender);
             }
         }
 
         emit LiquidityReleased(lender, asset, principal);
     }
 
-    /// @notice Credits a lender's per-loan proceeds balance with their share of a buyback or default claim.
-    /// @dev Core passes USDC amount, which is converted to shares for internal storage.
-    ///      Proceeds are intentionally isolated from globalDeposit to prevent auto-allocation.
-    /// @param loanId The loan ID the proceeds relate to.
-    /// @param lender The lender to credit.
-    /// @param amount USDC amount to credit.
-    function creditLoanProceeds(uint256 loanId, address lender, uint256 amount) external {
-        _onlyActiveCore();
-        uint256 shares = _usdcToShares(amount);
-        loanProceeds[msg.sender][loanId][lender] += shares;
-        emit LoanProceedsCredited(loanId, lender, amount);
-    }
-
-    /// @notice Pulls buyback USDC from the borrower directly into this contract.
-    /// @dev Called by Core during buyback. The borrower must have approved this contract (not Core)
-    ///      for USDC transfers. This keeps Core stateless for USDC and simplifies upgrade paths.
+    /// @notice Pulls buyback USDC from the borrower, deposits it into the vault, and records
+    ///         the actual shares minted for proportional distribution across lenders.
+    /// @dev Called by Core once per buyback payment before settleBuybackForLender. The borrower
+    ///      must have approved this contract (not Core) for USDC transfers. Keyed by loanId so
+    ///      concurrent loans remain isolated. Resets any prior allocation state for the same
+    ///      (core, loanId) pair to support multiple partial payments over a loan's lifetime.
     /// @param from The borrower address to pull USDC from.
     /// @param amount The USDC amount to pull.
-    function pullBuybackPayment(address from, uint256 amount) external {
+    /// @param loanId The loan ID this payment corresponds to.
+    function pullBuybackPayment(address from, uint256 amount, uint256 loanId) external {
         _onlyActiveCore();
         USDC.safeTransferFrom(from, address(this), amount);
-        _wrapToVault(amount);
+        uint256 actualShares = _wrapToVault(amount);
+        _pendingPaymentUsdc[msg.sender][loanId] = amount;
+        _pendingPaymentShares[msg.sender][loanId] = actualShares;
+        delete _pendingPaymentUsdcAllocated[msg.sender][loanId];
+        delete _pendingPaymentSharesAllocated[msg.sender][loanId];
     }
 
     /// @notice Writes off a lender's position when a loan expires unredeemed (default path).
-    /// @dev Unlike releaseLiquidity, this also decrements globalDeposit to reflect that the
-    ///      principal USDC was permanently lost — the lender receives collateral tokens as
-    ///      compensation instead (handled by Core). No USDC returns to this contract on this path.
+    /// @dev Decrements both globalLocked and globalDeposit to reflect that the principal USDC
+    ///      was permanently lost — the lender receives collateral tokens as compensation instead
+    ///      (handled by Core). No USDC returns to this contract on this path.
     /// @param loanId The loan ID being written off.
     /// @param lender The lender whose position to write off.
     /// @param asset The collateral asset the liquidity was locked for.
@@ -939,14 +1027,28 @@ contract BasedLoansLendingLedger is Ownable {
         if (shares > _accounts[lender].globalLocked) shares = _accounts[lender].globalLocked;
         if (shares > _accounts[lender].globalDeposit) shares = _accounts[lender].globalDeposit;
         _loanSharesRemaining[msg.sender][loanId][lender] = 0;
-        uint256 assetShares = shares;
-        if (assetShares > _caps[lender][asset].utilized) assetShares = _caps[lender][asset].utilized;
+        // Use per-loan USDC remaining for cap utilization. `amount` from Core can
+        // floor to 0 on tiny default dust; _loanUsdcRemaining has the correct exposure to clear.
+        uint256 remainingUsdc = _loanUsdcRemaining[msg.sender][loanId][lender];
+        uint256 assetRelease = remainingUsdc > 0 ? remainingUsdc : amount;
+        _loanUsdcRemaining[msg.sender][loanId][lender] = 0;
+        if (assetRelease > _caps[lender][asset].utilized) revert ShareAccountingInvariantBroken();
 
         _accounts[lender].globalLocked -= shares;
         _accounts[lender].globalDeposit -= shares;
-        _caps[lender][asset].utilized -= assetShares;
+        _caps[lender][asset].utilized -= assetRelease;
+        totalUtilizedUsdc -= assetRelease;
         totalLocked -= shares;
         totalDeposited -= shares;
+        // If lender opted out (maxCap == 0) and fully written off, free the slot.
+        if (_caps[lender][asset].utilized == 0 && _caps[lender][asset].maxCap == 0
+                && _lenderAssetConfigured[lender][asset]) {
+            _removeLenderAsset(lender, asset);
+        }
+        // Re-enqueue if the lender still has usable capacity after absorbing the loss.
+        if (!isQueued[asset][lender] && _hasUsableCapacity(lender, asset)) {
+            _enqueue(asset, lender);
+        }
         emit PositionWrittenOff(lender, asset, amount);
     }
 
@@ -967,32 +1069,25 @@ contract BasedLoansLendingLedger is Ownable {
     }
 
     /// @dev Maximum USDC the vault can actually deliver right now. Per-lender idle
-    ///      balances may exceed this due to deferred redeem-fee socialization.
-    ///      Callers use this to cap withdrawal/matching amounts at reality.
+    ///      balances reflect locked fee-inclusive shares so sum(globalDeposit) equals
+    ///      totalDeposited; this cap guards against any residual gap from the proceeds
+    ///      claim path or direct vault donations. Callers use it to cap amounts at reality.
     function _vaultDeliverable() internal view returns (uint256) {
         if (vault == address(0)) return type(uint256).max;
         return _sharesToUsdcNet(IERC4626(vault).balanceOf(address(this)));
     }
 
-    /// @dev Redeems USDC from the ERC-4626 vault. Returns actual shares burned.
-    ///      Accounts for vault redeem fees by using previewWithdraw.
-    ///      Caps withdrawal at vault.maxWithdraw as defense-in-depth against
-    ///      fee changes between availability calculation and actual withdrawal.
+    /// @dev Withdraws exactly `amount` USDC from the ERC-4626 vault using withdraw().
+    ///      Returns actual shares burned. Reverts if amount exceeds vault.maxWithdraw.
+    ///      Uses withdraw() not redeem(previewWithdraw()) because fee-bearing vaults can have
+    ///      a dead zone where previewWithdraw(X) claims no fee needed, but redeem() applies
+    ///      the fee anyway — delivering less than X. withdraw() always delivers exactly X USDC.
     ///      No-op when vault is address(0), returns amount (1:1).
     function _unwrapFromVault(uint256 amount) internal returns (uint256 sharesBurned) {
         if (vault == address(0) || amount == 0) return amount;
         IERC4626 v = IERC4626(vault);
-        sharesBurned = v.previewWithdraw(amount);
-        uint256 bal = v.balanceOf(address(this));
-        if (sharesBurned > bal) sharesBurned = bal;
-        uint256 usdcOut = v.redeem(sharesBurned, address(this), address(this));
-        if (usdcOut < amount) {
-            if (sharesBurned < bal) {
-                usdcOut += v.redeem(1, address(this), address(this));
-                sharesBurned += 1;
-            }
-            if (usdcOut < amount) revert VaultMaxWithdrawExceeded();
-        }
+        if (amount > v.maxWithdraw(address(this))) revert VaultMaxWithdrawExceeded();
+        sharesBurned = v.withdraw(amount, address(this), address(this));
     }
 
     /// @dev Converts mUSDC shares to USDC (gross, before redeem fees).
@@ -1025,6 +1120,32 @@ contract BasedLoansLendingLedger is Ownable {
         return IERC4626(vault).convertToShares(usdc);
     }
 
+    /// @dev Shares that _unwrapFromVault(usdc) will actually burn via vault.withdraw().
+    ///      Uses previewWithdrawFrom (owner-aware) so the locked share count at origination
+    ///      matches the burned count at disbursement.
+    ///      Falls back to previewWithdraw for standard ERC-4626 vaults without the extension.
+    function _usdcToWithdrawShares(uint256 usdc) internal view returns (uint256) {
+        if (vault == address(0)) return usdc;
+        try IOwnerPreviewVault(vault).previewWithdrawFrom(address(this), usdc) returns (uint256 s) {
+            return s;
+        } catch {
+            return IERC4626(vault).previewWithdraw(usdc);
+        }
+    }
+
+    /// @dev Returns true only when a lender has both idle liquidity and remaining cap
+    ///      that together meet the minimum fill threshold. Used by all enqueue paths
+    ///      to prevent unusable entries from bloating the queue.
+    function _hasUsableCapacity(address lender, address asset) internal view returns (bool) {
+        uint256 idleShares = _accounts[lender].globalDeposit - _accounts[lender].globalLocked;
+        uint256 idleUsdc = _sharesToUsdcNet(idleShares);
+        AssetCap storage cap = _caps[lender][asset];
+        if (cap.maxCap == 0) return false;
+        uint256 remainingCap = cap.maxCap > cap.utilized ? cap.maxCap - cap.utilized : 0;
+        uint256 usable = idleUsdc < remainingCap ? idleUsdc : remainingCap;
+        return usable >= minAssetCap;
+    }
+
     /// @dev Appends a lender to the tail of the FIFO queue for the given asset.
     function _enqueue(address asset, address lender) internal {
         Queue storage q = _assetQueues[asset];
@@ -1037,6 +1158,32 @@ contract BasedLoansLendingLedger is Ownable {
         }
         isQueued[asset][lender] = true;
         emit Enqueued(lender, asset);
+    }
+
+    /// @dev Removes `current` from the FIFO queue for `asset`, safely reconnecting the
+    ///      linked list regardless of whether current is the head, tail, or a middle node.
+    ///      `prev` is the last node that was NOT removed (address(0) when current == head).
+    ///      `next` must be current's original nextInLine, captured before this call.
+    function _unlinkQueued(address asset, address prev, address current, address next) internal {
+        Queue storage q = _assetQueues[asset];
+
+        if (prev == address(0)) {
+            q.head = next;
+        } else {
+            nextInLine[asset][prev] = next;
+        }
+
+        if (q.tail == current) {
+            q.tail = prev;
+        }
+
+        nextInLine[asset][current] = address(0);
+        isQueued[asset][current] = false;
+
+        // Extra safety: if head was just set to zero, ensure tail is also zero.
+        if (q.head == address(0)) {
+            q.tail = address(0);
+        }
     }
 
     /// @dev Swap-and-pop removal of an asset from a lender's configured asset list.
@@ -1059,15 +1206,15 @@ contract BasedLoansLendingLedger is Ownable {
     // =============================================================
 
     /// @notice Returns protocol-wide aggregate USDC stats.
-    /// @return deposited Sum of all lender globalDeposit values (gross, pre-fee).
-    /// @return locked Sum of all lender globalLocked values (gross, pre-fee).
-    /// @return idle Total unlocked USDC available for new loans (net, post-fee).
+    /// @return deposited Total USDC value of all lender positions: idle share value + active loan principal.
+    /// @return locked Total USDC principal currently locked across all active loans (sum of cap utilization).
+    /// @return idle Total net USDC available for new loans (physical idle shares, post-fee, capped at vault deliverable).
     function getProtocolStats() external view returns (uint256 deposited, uint256 locked, uint256 idle) {
-        deposited = _sharesToUsdc(totalDeposited);
-        locked = _sharesToUsdc(totalLocked);
+        locked = totalUtilizedUsdc;
         idle = _sharesToUsdcNet(totalDeposited - totalLocked);
         uint256 deliverable = _vaultDeliverable();
         if (idle > deliverable) idle = deliverable;
+        deposited = idle + locked;
     }
 
     /// @notice Returns the depth (number of lenders) in the FIFO queue for an asset.
@@ -1105,7 +1252,7 @@ contract BasedLoansLendingLedger is Ownable {
         while (current != address(0) && lenderCount < limit) {
             uint256 idle = _sharesToUsdcNet(_accounts[current].globalDeposit - _accounts[current].globalLocked);
             uint256 _maxCap = _caps[current][asset].maxCap;
-            uint256 _utilizedUsdc = _sharesToUsdcNet(_caps[current][asset].utilized);
+            uint256 _utilizedUsdc = _caps[current][asset].utilized;
             uint256 availAsset = _maxCap > _utilizedUsdc ? _maxCap - _utilizedUsdc : 0;
             uint256 canLend = idle < availAsset ? idle : availAsset;
 
@@ -1143,12 +1290,12 @@ contract BasedLoansLendingLedger is Ownable {
     /// @notice Returns a complete snapshot of a lender's account and all configured asset positions.
     /// @dev Combines getAccount + getLenderAssets + getAssetCap + isLenderQueued into one call.
     /// @param lender The lender address to query.
-    /// @return deposited Total USDC the lender is owed.
-    /// @return locked Total USDC locked in active loans.
-    /// @return idle Unlocked USDC available.
+    /// @return deposited Total USDC value of the lender's position: idle share value + active loan principal.
+    /// @return locked Total USDC principal locked in active loans (sum of per-asset cap utilization).
+    /// @return idle Net USDC value of unlocked vault shares (post-fee, capped at vault deliverable).
     /// @return assets Configured asset addresses (non-zero cap).
     /// @return maxCaps Maximum allocation per asset.
-    /// @return utilized Amount currently locked per asset.
+    /// @return utilized Amount currently locked per asset in USDC.
     /// @return queued Whether the lender is currently queued per asset.
     function getLenderSummary(address lender)
         external
@@ -1164,12 +1311,6 @@ contract BasedLoansLendingLedger is Ownable {
         )
     {
         Account storage acct = _accounts[lender];
-        deposited = _sharesToUsdc(acct.globalDeposit);
-        locked = _sharesToUsdc(acct.globalLocked);
-        idle = _sharesToUsdcNet(acct.globalDeposit - acct.globalLocked);
-        uint256 deliverable = _vaultDeliverable();
-        if (idle > deliverable) idle = deliverable;
-
         assets = _lenderAssets[lender];
         uint256 len = assets.length;
         maxCaps = new uint256[](len);
@@ -1179,27 +1320,42 @@ contract BasedLoansLendingLedger is Ownable {
         for (uint256 i = 0; i < len; i++) {
             AssetCap storage cap = _caps[lender][assets[i]];
             maxCaps[i] = cap.maxCap;
-            utilized[i] = _sharesToUsdc(cap.utilized);
+            utilized[i] = cap.utilized;
             queued[i] = isQueued[assets[i]][lender];
+            locked += cap.utilized;
         }
+
+        idle = _sharesToUsdcNet(acct.globalDeposit - acct.globalLocked);
+        uint256 deliverable = _vaultDeliverable();
+        if (idle > deliverable) idle = deliverable;
+        deposited = idle + locked;
     }
 
     /// @notice Returns the account totals for a lender.
+    /// @dev `locked` uses per-asset USDC cap utilization rather than converting locked shares at
+    ///      the current vault exchange rate. Locked shares are redeemed when a loan is disbursed
+    ///      and no longer exist in the vault, so applying the live PPS to them produces inflated
+    ///      values whenever the vault exchange rate rises after disbursement (e.g. from fee donations
+    ///      with few idle shares). `idle` is unaffected — those shares still physically exist in vault.
     /// @param lender The lender address to query.
-    /// @return deposited Total USDC the lender is owed (globalDeposit).
-    /// @return locked Total USDC currently locked in active loans.
-    /// @return idle Unlocked USDC available for withdrawal or new loans.
+    /// @return deposited Total USDC value of the lender's position: idle share value + active loan principal.
+    /// @return locked Total USDC principal currently locked in active loans (sum of per-asset cap utilization).
+    /// @return idle Net USDC value of unlocked vault shares available for withdrawal or new loans.
     function getAccount(address lender)
         external
         view
         returns (uint256 deposited, uint256 locked, uint256 idle)
     {
         Account storage acct = _accounts[lender];
-        deposited = _sharesToUsdc(acct.globalDeposit);
-        locked = _sharesToUsdc(acct.globalLocked);
+        address[] storage assets = _lenderAssets[lender];
+        uint256 len = assets.length;
+        for (uint256 i; i < len; i++) {
+            locked += _caps[lender][assets[i]].utilized;
+        }
         idle = _sharesToUsdcNet(acct.globalDeposit - acct.globalLocked);
         uint256 deliverable = _vaultDeliverable();
         if (idle > deliverable) idle = deliverable;
+        deposited = idle + locked;
     }
 
     /// @notice Returns the asset-specific cap and utilization for a lender.
@@ -1214,9 +1370,9 @@ contract BasedLoansLendingLedger is Ownable {
         returns (uint256 maxCap, uint256 utilized, uint256 remaining)
     {
         AssetCap storage cap = _caps[lender][asset];
-        uint256 utilizedUsdc = _sharesToUsdc(cap.utilized);
-        uint256 rem = cap.maxCap > utilizedUsdc ? cap.maxCap - utilizedUsdc : 0;
-        return (cap.maxCap, utilizedUsdc, rem);
+        // utilized is USDC; no share conversion needed
+        uint256 rem = cap.maxCap > cap.utilized ? cap.maxCap - cap.utilized : 0;
+        return (cap.maxCap, cap.utilized, rem);
     }
 
     /// @notice Returns the claimable proceeds for a specific Core's loan and lender, in USDC.

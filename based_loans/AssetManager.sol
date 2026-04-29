@@ -55,7 +55,6 @@ contract BasedLoansAssetManager is Ownable {
     event AssetRemoved(address indexed asset);
     event AssetExposureUpdated(address indexed asset, uint256 maxExposureUsdc);
     event OperatorUpdated(address oldOperator, address newOperator);
-    event MinAssetCapUpdated(uint256 oldMinAssetCap, uint256 newMinAssetCap);
 
     // =============================================================
     // ERRORS
@@ -76,7 +75,6 @@ contract BasedLoansAssetManager is Ownable {
     error WethSourcesRequired();
     error InvalidWethSourceType(uint256 index);
     error NotOperatorOrOwner();
-    error InvalidMinAssetCap();
 
     // =============================================================
     // IMMUTABLE GUARDRAILS (Hardcoded)
@@ -95,9 +93,6 @@ contract BasedLoansAssetManager is Ownable {
 
     /// @notice Optional operator address for emergency/agile functions.
     address public operator;
-
-    /// @notice Minimum collateral value cap for assets managed by this contract.
-    uint256 public minAssetCap;
 
     mapping(address => AssetConfig) internal assetConfigs;
 
@@ -135,15 +130,6 @@ contract BasedLoansAssetManager is Ownable {
         emit OperatorUpdated(old, _operator);
     }
 
-    /// @notice Sets the minimum asset cap. Callable by operator or owner.
-    /// @param _minAssetCap New minimum asset cap value.
-    function setMinAssetCap(uint256 _minAssetCap) external onlyOperatorOrOwner {
-        if (_minAssetCap == 0) revert InvalidMinAssetCap();
-        uint256 old = minAssetCap;
-        minAssetCap = _minAssetCap;
-        emit MinAssetCapUpdated(old, _minAssetCap);
-    }
-
     /// @notice Creates or fully replaces the configuration for an asset.
     /// @dev If any entry in `sources` is TOKEN_WETH_POOL, `wethSources` must be non-empty.
     ///      All entries in `wethSources` must be DIRECT_USD type.
@@ -151,7 +137,9 @@ contract BasedLoansAssetManager is Ownable {
     /// @param sources Oracle paths used to price the collateral token (1–5 entries).
     /// @param wethSources Oracle paths used to fetch WETH/USD price (0–5 entries, all DIRECT_USD).
     /// @param maxDeviationBps Maximum acceptable price deviation across sources in BPS.
-    /// @param maxLtvBps Maximum loan-to-value ratio in BPS (2000–8500).
+    /// @param maxLtvBps Maximum principal LTV in basis points (2000–8500). Caps the USDC principal
+    ///        that may be disbursed against collateral value. Does not cap the final buyback price,
+    ///        which includes the fixed term premium and is disclosed upfront at loan open time.
     /// @param minSources Minimum number of valid oracle sources required for a price.
     /// @param active Whether the asset is immediately active for borrowing.
     function setAssetConfig(
@@ -249,7 +237,7 @@ contract BasedLoansAssetManager is Ownable {
     /// @notice Updates the risk parameters for an already-configured asset.
     /// @param asset The collateral asset address to update.
     /// @param maxDeviationBps Maximum acceptable price deviation in BPS.
-    /// @param maxLtvBps Maximum loan-to-value ratio in BPS (2000–8500).
+    /// @param maxLtvBps Maximum principal LTV in BPS (2000–8500). Caps disbursed principal only.
     /// @param minSources Minimum number of oracle sources required.
     function setAssetRiskParams(
         address asset,
@@ -271,9 +259,9 @@ contract BasedLoansAssetManager is Ownable {
         emit AssetRiskParamsUpdated(asset, maxDeviationBps, maxLtvBps, minSources);
     }
 
-    /// @notice Updates only the LTV for an already-configured asset.
+    /// @notice Updates only the principal LTV for an already-configured asset.
     /// @param asset The collateral asset address to update.
-    /// @param maxLtvBps New maximum loan-to-value ratio in BPS (2000–8500).
+    /// @param maxLtvBps New maximum principal LTV in BPS (2000–8500). Caps disbursed principal only.
     function setAssetLtv(address asset, uint16 maxLtvBps) external onlyOperatorOrOwner {
         _validateAsset(asset);
 

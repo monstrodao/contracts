@@ -55,20 +55,38 @@ contract UniswapV3Adapter is IOracleAdapter {
             (,,,,, hopPool, hopQuote) = abi.decode(data, (address, uint32, address, address, address, address, address));
         }
 
+        // L-01: optional 8th param — separate TWAP window for second hop.
+        // Defaults to twapWindow if not provided.
+        uint32 twapWindow1 = twapWindow;
+        if (data.length >= 256) {
+            (,,,,,,,twapWindow1) = abi.decode(data, (address, uint32, address, address, address, address, address, uint32));
+        }
+
         if (twapWindow == 0) revert InvalidWindow();
+        if (hopPool != address(0) && twapWindow1 == 0) revert InvalidWindow();
 
         // First hop: base → quote (e.g. PLAZM → ESHARE)
         price = _getTwapPrice(pool, twapWindow, baseToken, quoteToken);
 
-        // Vault conversion on first hop quote token (e.g. mUSDC → USDC)
+        // Vault conversion on first hop quote token (e.g. mUSDC → USDC).
+        // Use actual vault share decimals and asset decimals instead of
+        // blindly passing 1e18 shares, which is wrong for non-18-decimal vaults.
         if (quoteVault != address(0)) {
-            uint256 rate = IERC4626Minimal(quoteVault).convertToAssets(ONE_18);
-            price = FullMath.mulDiv(price, rate, ONE_18);
+            IERC4626Minimal v = IERC4626Minimal(quoteVault);
+            uint8 vaultDec = v.decimals();
+            uint8 assetDec = IERC20MetadataMinimal(v.asset()).decimals();
+            if (vaultDec > 18 || assetDec > 18) revert InvalidDecimals();
+            uint256 oneShare = 10 ** vaultDec;
+            uint256 assetsPerShare = v.convertToAssets(oneShare);
+            // assetsPerShare is in assetDec units; normalize to 1e18 for mulDiv
+            uint256 rateE18 = FullMath.mulDiv(assetsPerShare, ONE_18, 10 ** assetDec);
+            price = FullMath.mulDiv(price, rateE18, ONE_18);
         }
 
         // Second hop: quote → hopQuote (e.g. ESHARE → WETH)
+        // L-01: uses twapWindow1 (separate from first hop window) to allow independent TWAP configs.
         if (hopPool != address(0)) {
-            uint256 hopPrice = _getTwapPrice(hopPool, twapWindow, quoteToken, hopQuote);
+            uint256 hopPrice = _getTwapPrice(hopPool, twapWindow1, quoteToken, hopQuote);
             price = FullMath.mulDiv(price, hopPrice, ONE_18);
         }
 
@@ -101,27 +119,35 @@ contract UniswapV3Adapter is IOracleAdapter {
 
         int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
         int24 avgTick = int24(tickDelta / int56(uint56(twapWindow)));
-        if (tickDelta < 0 && (tickDelta % int56(uint56(twapWindow)) != 0)) avgTick--;
+        // Round conservatively based on price direction.
+        // Forward (base=token0): floor negative remainder → lower tick → lower price → conservative.
+        // Inverse (base=token1): ceil positive remainder → higher tick → lower inverse price → conservative.
+        int56 remainder = tickDelta % int56(uint56(twapWindow));
+        if (remainder != 0) {
+            if (baseIsT0) {
+                if (tickDelta < 0) avgTick--;
+            } else {
+                if (tickDelta > 0) avgTick++;
+            }
+        }
 
         uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(avgTick);
 
-        uint256 baseDec = uint256(IERC20MetadataMinimal(baseToken).decimals());
-        uint256 quoteDec = uint256(IERC20MetadataMinimal(quoteToken).decimals());
-        if (baseDec > 18 || quoteDec > 18) revert InvalidDecimals();
+        uint256 token0Dec = uint256(IERC20MetadataMinimal(t0).decimals());
+        uint256 token1Dec = uint256(IERC20MetadataMinimal(t1).decimals());
+        if (token0Dec > 18 || token1Dec > 18) revert InvalidDecimals();
 
         uint256 rawP18 = FullMath.mulDiv(uint256(sqrtPriceX96), uint256(sqrtPriceX96) * ONE_18, Q192);
 
+        // rawP18 encodes token1 raw units per token0 raw unit (scaled to 1e18).
+        // Forward: base is token0, scale by token0/token1 decimals.
+        // Inverse: base is token1, invert raw price, scale by token1/token0 decimals.
         if (baseIsT0) {
-            price = rawP18;
+            price = FullMath.mulDiv(rawP18, 10 ** token0Dec, 10 ** token1Dec);
         } else {
             if (rawP18 == 0) revert InvalidPrice();
-            price = FullMath.mulDiv(ONE_18, ONE_18, rawP18);
-        }
-
-        if (quoteDec >= baseDec) {
-            price = price / (10 ** (quoteDec - baseDec));
-        } else {
-            price = price * (10 ** (baseDec - quoteDec));
+            uint256 inverseP18 = FullMath.mulDiv(ONE_18, ONE_18, rawP18);
+            price = FullMath.mulDiv(inverseP18, 10 ** token1Dec, 10 ** token0Dec);
         }
     }
 }

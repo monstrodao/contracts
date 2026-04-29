@@ -278,7 +278,15 @@ contract BasedLoansOracleManager is Ownable {
             // UniswapV3 / Algebra data: abi.encode(address pool, uint32 twapWindow, ...) = 128 bytes
             if (path.data.length < 128) return true;
             (, uint32 configuredWindow,,) = abi.decode(path.data, (address, uint32, address, address));
-            return configuredWindow >= minTwapWindow;
+            if (configuredWindow < minTwapWindow) return false;
+            // L-01: two-hop 8-param encoding adds twapWindow1 for the second pool (256 bytes).
+            // Enforce the same floor on the second-hop window when it is explicitly provided.
+            if (path.data.length >= 256) {
+                (,,,,,,, uint32 configuredWindow1) =
+                    abi.decode(path.data, (address, uint32, address, address, address, address, address, uint32));
+                if (configuredWindow1 < minTwapWindow) return false;
+            }
+            return true;
         }
     }
 

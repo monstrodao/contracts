@@ -52,7 +52,7 @@ interface ILendingLedger {
         returns (uint256 totalFound, address[] memory lenders, uint256[] memory amounts, uint256 foundCount);
     function disburseLoan(address to, uint256 amount) external;
     function settleBuybackForLender(uint256 loanId, address lender, address asset, uint256 principal, uint256 totalPayment, uint256 originalFunded) external;
-    function pullBuybackPayment(address from, uint256 amount) external;
+    function pullBuybackPayment(address from, uint256 amount, uint256 loanId) external;
     function writeOffPosition(uint256 loanId, address lender, address asset, uint256 amount) external;
 }
 
@@ -111,9 +111,9 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
     error ExposureCapExceeded(address asset, uint256 current, uint256 cap);
     error EthRefundFailed();
     error ShortfallTooLarge(uint256 funded, uint256 requested, uint256 maxShortfallBps);
+    error ShortfallTooLoose(uint256 borrowerBps, uint256 globalMaxBps);
     error NotOperatorOrOwner();
     error InvalidClaimBatch();
-    error LoanArchived();
     error InvalidContract(address);
 
     // =============================================================
@@ -123,11 +123,13 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
     struct Loan {
         address borrower;
         address asset;
+        address ledgerAtOpen;         // Q-03: ledger used when this loan was opened; settlement always routes here
         uint256 collateralAmount;     // Original collateral deposited
         uint256 collateralRemaining;  // Collateral still held by Core
         uint256 totalFunded;          // Total USDC locked from lenders
         uint256 buybackPrice;         // Fixed full repayment amount (set at origination)
         uint256 buybackRemaining;     // Unpaid portion of buybackPrice
+        uint256 exposureRemaining;    // L-04: per-loan exposure tracking (avoids assetExposure dust)
         uint32 createdAt;
         uint32 expiryTimestamp;
         bool active;                  // False once fully bought back
@@ -140,7 +142,6 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
     // =============================================================
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant PRICE_SCALE = 1e18;
 
     /// @notice Minimum USDC loan amount (50 USDC, 6 decimals).
     uint256 public constant MIN_LOAN_USDC = 50e6;
@@ -150,6 +151,11 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
 
     /// @notice Number of supported loan terms.
     uint8 public constant TERM_COUNT = 3;
+
+    /// @notice Sentinel value for borrowerMaxShortfallBps meaning "use the protocol global default."
+    ///         Allows borrowers to request exact fill (0) without ambiguity with the default case.
+    ///         Frontend should pass this value when no per-loan shortfall override is desired.
+    uint256 public constant USE_GLOBAL_SHORTFALL = type(uint16).max;
 
     // =============================================================
     //                           STORAGE
@@ -192,12 +198,12 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
     /// @notice True once writeOffPosition has been called for all lenders on a defaulted loan.
     mapping(uint256 => bool) public loanSettled;
 
+    /// @notice Snapshot of collateralRemaining at first-claim time for a defaulted loan.
+    ///         Fixed base used for all per-lender share calculations to eliminate claim-order dependence.
+    mapping(uint256 => uint256) public defaultCollateralBase;
+
     /// @notice Total USDC currently in active loans per collateral asset.
     mapping(address => uint256) public assetExposure;
-
-    /// @notice Loan ID cutoff set when the ledger is swapped. Loans below this ID are archived.
-    ///         Default 0 means all loans are valid (no archive cutoff).
-    uint256 public loanStartId;
 
     // =============================================================
     //                             EVENTS
@@ -236,7 +242,6 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         address pyth
     );
     event TermsUpdated(uint32[3] durations, uint16[3] premiumsBps);
-    event LoanArchiveCutoff(uint256 newStartId);
 
     // =============================================================
     //                           MODIFIERS
@@ -322,12 +327,7 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         if (_ledger.code.length == 0) revert InvalidContract(_ledger);
         if (_feeDistributor.code.length == 0) revert InvalidContract(_feeDistributor);
 
-        // Archive all existing loans when the ledger is swapped
-        if (_ledger != address(ledger)) {
-            loanStartId = nextLoanId;
-            emit LoanArchiveCutoff(nextLoanId);
-        }
-
+        // Updates module addresses for future operations. Existing loans continue settling through their ledgerAtOpen.
         assetManager = IAssetManager(_assetManager);
         oracleManager = IOracleManager(_oracleManager);
         ledger = ILendingLedger(_ledger);
@@ -394,6 +394,7 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         uint256 collateralAmount,
         uint256 requestedGrossUsdc,
         uint8 termIndex,
+        uint256 borrowerMaxShortfallBps,
         bytes[] calldata pythUpdateData
     ) external payable nonReentrant returns (uint256 loanId) {
         if (paused) revert Paused();
@@ -441,7 +442,11 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         uint8 tokenDecimals = IERC20Metadata(asset).decimals();
         uint256 tokenScale = 10 ** tokenDecimals;
         uint256 collateralValueUsdc6 = minPriceUsdc18.mulDiv(collateralAmount, tokenScale * 1e12);
-        uint256 maxLoanUsdc = collateralValueUsdc6.mulDiv(maxLtvBps, BPS_DENOMINATOR);
+        // maxLtvBps is principal LTV. It caps the USDC principal
+        // disbursed to the borrower, not the total buyback obligation. The fixed buyback price
+        // is calculated separately after funding using the selected term premium and may exceed
+        // this principal cap by the disclosed premium. This matches the pawn shop model.
+        uint256 maxPrincipalUsdc = collateralValueUsdc6.mulDiv(maxLtvBps, BPS_DENOMINATOR);
 
         // Determine target USDC and how much collateral to pull.
         // When requestedGrossUsdc is specified, work backwards from the USDC amount
@@ -464,12 +469,12 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
                 targetUsdc = requestedGrossUsdc;
             } else {
                 // Cap exceeded — use max from the capped collateral amount
-                targetUsdc = maxLoanUsdc;
+                targetUsdc = maxPrincipalUsdc;
                 neededCollateral = collateralAmount;
             }
         } else {
             // No specific request: derive target from collateral valuation.
-            targetUsdc = maxLoanUsdc;
+            targetUsdc = maxPrincipalUsdc;
             neededCollateral = collateralAmount;
         }
 
@@ -489,11 +494,19 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
             }
         }
 
-        // Check shortfall — revert if liquidity dropped too far below requested
+        // Check shortfall — revert if liquidity dropped too far below requested.
+        // USE_GLOBAL_SHORTFALL (type(uint16).max) = use protocol default; 0 = exact fill only;
+        // any other value must be <= maxShortfallBps (borrower can only be stricter, not looser).
+        if (borrowerMaxShortfallBps != USE_GLOBAL_SHORTFALL && borrowerMaxShortfallBps > maxShortfallBps) {
+            revert ShortfallTooLoose(borrowerMaxShortfallBps, maxShortfallBps);
+        }
+        uint256 effectiveShortfallBps = borrowerMaxShortfallBps == USE_GLOBAL_SHORTFALL
+            ? maxShortfallBps
+            : borrowerMaxShortfallBps;
         if (totalFunded < targetUsdc) {
             uint256 shortfall = (targetUsdc - totalFunded) * BPS_DENOMINATOR / targetUsdc;
-            if (shortfall > maxShortfallBps) {
-                revert ShortfallTooLarge(totalFunded, targetUsdc, maxShortfallBps);
+            if (shortfall > effectiveShortfallBps) {
+                revert ShortfallTooLarge(totalFunded, targetUsdc, effectiveShortfallBps);
             }
         }
 
@@ -519,9 +532,11 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         loan.asset = asset;
         loan.collateralAmount = actualCollateral;
         loan.collateralRemaining = actualCollateral;
+        loan.ledgerAtOpen = address(ledger);
         loan.totalFunded = totalFunded;
         loan.buybackPrice = buybackPrice;
         loan.buybackRemaining = buybackPrice;
+        loan.exposureRemaining = totalFunded;
         loan.createdAt = uint32(block.timestamp);
         loan.expiryTimestamp = expiryTimestamp;
         loan.active = true;
@@ -556,8 +571,6 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
     /// @param loanId The loan to buy back against.
     /// @param payment USDC amount to pay. Capped at buybackRemaining.
     function buyback(uint256 loanId, uint256 payment) external nonReentrant {
-        if (loanStartId > 0 && loanId < loanStartId) revert LoanArchived();
-
         Loan storage loan = _loans[loanId];
 
         if (!loan.active) revert LoanInactive();
@@ -578,18 +591,28 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         loan.collateralRemaining -= collateralToReturn;
         loan.buybackRemaining -= payment;
 
-        // Decrease exposure by principal component of this payment
+        // L-04: reduce assetExposure by the delta of per-loan exposureRemaining.
+        // Using the delta (not a fresh proportional formula) ensures that on the final payment
+        // all remaining dust is swept from assetExposure rather than left behind by floor rounding.
         {
-            uint256 principalReturned = loan.totalFunded * payment / loan.buybackPrice;
-            if (principalReturned > assetExposure[loan.asset]) {
+            uint256 oldExposure = loan.exposureRemaining;
+            uint256 newExposure = isFinal
+                ? 0
+                : loan.totalFunded * loan.buybackRemaining / loan.buybackPrice;
+            // oldExposure >= newExposure always holds: we are paying down, never up.
+            uint256 exposureReduction = oldExposure - newExposure;
+            if (exposureReduction > assetExposure[loan.asset]) {
                 assetExposure[loan.asset] = 0;
             } else {
-                assetExposure[loan.asset] -= principalReturned;
+                assetExposure[loan.asset] -= exposureReduction;
             }
+            loan.exposureRemaining = newExposure;
         }
 
         // Pull payment USDC from borrower FIRST via LendingLedger (borrower approves Ledger, not Core)
-        ledger.pullBuybackPayment(msg.sender, payment);
+        // Q-03: always route through the ledger that was active when this loan was opened.
+        ILendingLedger loanLedger = ILendingLedger(loan.ledgerAtOpen);
+        loanLedger.pullBuybackPayment(msg.sender, payment, loanId);
 
         // Distribute payment to lenders: each gets their proportional share
         // Last lender absorbs any integer-division dust
@@ -608,14 +631,27 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
                 remaining -= lenderPayment;
             }
 
-            // Principal = portion that was originally locked. Yield = the rest.
-            uint256 principal = funded * payment / loan.buybackPrice;
-            if (principal > lenderPayment) principal = lenderPayment;
+            // Principal controls locked-share release in LendingLedger.
+            // On the final buyback, force principal = funded so the Ledger's clamp
+            // (principalLockedRelease = min(computed, remainingShares)) absorbs any
+            // rounding dust accumulated across partial repayments. Without this,
+            // funded * payment / buybackPrice floors at integer division and can leave
+            // 1–2 shares locked even after the loan is fully repaid.
+            // On partial buybacks, clamp principal to lenderPayment so it never exceeds
+            // what was actually paid (they are separate accounting concepts, so the
+            // clamp is only needed when proportional math could exceed the payment itself).
+            uint256 principal;
+            if (isFinal) {
+                principal = funded;
+            } else {
+                principal = funded * payment / loan.buybackPrice;
+                if (principal > lenderPayment) principal = lenderPayment;
+            }
 
             // LendingLedger handles the auto-redeploy toggle internally:
             // ON  → principal unlocks to idle, yield added to idle (all auto-redeployed)
             // OFF → principal + yield both go to claimable proceeds
-            ledger.settleBuybackForLender(loanId, lender, loan.asset, principal, lenderPayment, funded);
+            loanLedger.settleBuybackForLender(loanId, lender, loan.asset, principal, lenderPayment, funded);
         }
 
         // Return collateral to borrower
@@ -641,8 +677,6 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
 
         for (uint256 j; j < loanIds.length; j++) {
             uint256 loanId = loanIds[j];
-            if (loanStartId > 0 && loanId < loanStartId) continue;
-
             Loan storage loan = _loans[loanId];
 
             if (!loan.active) continue;
@@ -662,28 +696,32 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
 
             // On first claim: write off all lender positions and clear remaining exposure
             if (!loanSettled[loanId]) {
-                // Clear remaining exposure for this loan's asset
-                uint256 remainingExposure = loan.totalFunded * loan.buybackRemaining / loan.buybackPrice;
+                // L-04: use per-loan exposureRemaining for accurate dust-free accounting.
+                uint256 remainingExposure = loan.exposureRemaining;
                 if (remainingExposure > assetExposure[loan.asset]) {
                     assetExposure[loan.asset] = 0;
                 } else {
                     assetExposure[loan.asset] -= remainingExposure;
                 }
+                loan.exposureRemaining = 0;
 
+                // Q-03: route write-offs through the ledger that was active at loan open.
+                ILendingLedger loanLedger = ILendingLedger(loan.ledgerAtOpen);
                 for (uint256 i = 0; i < lenderCount; i++) {
                     address lender = loan.lenders[i];
                     uint256 remainingPrincipal = loan.amounts[i] * loan.buybackRemaining / loan.buybackPrice;
-                    if (remainingPrincipal > 0) {
-                        ledger.writeOffPosition(loanId, lender, loan.asset, remainingPrincipal);
-                    }
+                    // Always call — Ledger uses _loanUsdcRemaining to clear exact tracked state
+                    // even when remainingPrincipal rounds to zero on partial-buyback dust.
+                    loanLedger.writeOffPosition(loanId, lender, loan.asset, remainingPrincipal);
                 }
+                defaultCollateralBase[loanId] = loan.collateralRemaining;
                 loanSettled[loanId] = true;
                 emit LoanSettled(loanId);
             }
 
-            // Calculate collateral share with dust-safe running tally.
-            // Each claim subtracts from collateralRemaining so the last claimant
-            // absorbs any integer-division dust rather than over-distributing.
+            // Calculate collateral share from the fixed defaultCollateralBase so claim order
+            // cannot affect proportional entitlement. collateralRemaining is only decremented
+            // for transfer accounting, with the final claimant receiving any rounding dust.
             uint256 collateralShare;
             {
                 // Count unclaimed lenders to detect the last one
@@ -692,17 +730,22 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
                     if (!collateralClaimed[loanId][loan.lenders[i]]) unclaimedCount++;
                 }
                 if (unclaimedCount == 1) {
-                    // Last claimant gets whatever remains (absorbs dust)
+                    // Last claimant gets whatever remains (absorbs integer-division dust)
                     collateralShare = loan.collateralRemaining;
                 } else {
-                    collateralShare = loan.collateralRemaining * loan.amounts[lenderIndex] / loan.totalFunded;
+                    collateralShare = defaultCollateralBase[loanId] * loan.amounts[lenderIndex] / loan.totalFunded;
+                    if (collateralShare > loan.collateralRemaining) collateralShare = loan.collateralRemaining;
                 }
             }
-            if (collateralShare == 0) continue;
-
+            // Mark claimed unconditionally so unclaimedCount decrements even on zero share.
+            // Without this, zero-share lenders permanently block the last-claimant dust path.
             collateralClaimed[loanId][msg.sender] = true;
-            loan.collateralRemaining -= collateralShare;
-            IERC20(loan.asset).safeTransfer(msg.sender, collateralShare);
+
+            if (collateralShare > 0) {
+                loan.collateralRemaining -= collateralShare;
+                IERC20(loan.asset).safeTransfer(msg.sender, collateralShare);
+            }
+
             emit CollateralClaimed(loanId, msg.sender, collateralShare);
         }
     }
@@ -735,36 +778,10 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         return (termDurations, termPremiumsBps);
     }
 
-    /// @notice Returns loan IDs opened by a borrower, excluding archived loans (< loanStartId).
+    /// @notice Returns all loan IDs opened by a borrower in origination order.
     /// @param borrower The borrower address to query.
-    /// @return Array of non-archived loan IDs in origination order.
     function getBorrowerLoans(address borrower) external view returns (uint256[] memory) {
-        uint256[] storage all = _borrowerLoans[borrower];
-        uint256 startId = loanStartId;
-        if (startId == 0) return all;
-
-        // Count non-archived loans
-        uint256 count;
-        for (uint256 i; i < all.length; i++) {
-            if (all[i] >= startId) count++;
-        }
-
-        // Build filtered array
-        uint256[] memory result = new uint256[](count);
-        uint256 idx;
-        for (uint256 i; i < all.length; i++) {
-            if (all[i] >= startId) {
-                result[idx++] = all[i];
-            }
-        }
-        return result;
-    }
-
-    /// @notice Returns true if the loan ID is archived (created before the current ledger).
-    /// @param loanId The loan ID to check.
-    /// @return True if the loan is archived.
-    function isLoanArchived(uint256 loanId) external view returns (bool) {
-        return loanStartId > 0 && loanId < loanStartId;
+        return _borrowerLoans[borrower];
     }
 
     /// @notice Returns the collateral amount a lender can currently claim from a defaulted loan.
@@ -783,7 +800,17 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
         uint256 lenderCount = loan.lenders.length;
         for (uint256 i = 0; i < lenderCount; i++) {
             if (loan.lenders[i] == lender) {
-                return loan.collateralRemaining * loan.amounts[i] / loan.totalFunded;
+                // Use fixed base if settlement has happened; otherwise use live collateralRemaining
+                uint256 base = loanSettled[loanId] ? defaultCollateralBase[loanId] : loan.collateralRemaining;
+                // Check if this is the last unclaimed lender (absorbs dust)
+                uint256 unclaimedCount;
+                for (uint256 j = 0; j < lenderCount; j++) {
+                    if (!collateralClaimed[loanId][loan.lenders[j]]) unclaimedCount++;
+                }
+                if (unclaimedCount == 1) return loan.collateralRemaining;
+                uint256 share = base * loan.amounts[i] / loan.totalFunded;
+                if (share > loan.collateralRemaining) share = loan.collateralRemaining;
+                return share;
             }
         }
         return 0;
@@ -836,6 +863,16 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
             loan.lenders,
             loan.amounts
         );
+    }
+
+    /// @notice Returns the per-loan exposure remaining (L-04: avoids accumulated division dust).
+    function getExposureRemaining(uint256 loanId) external view returns (uint256) {
+        return _loans[loanId].exposureRemaining;
+    }
+
+    /// @notice Returns the ledger address recorded when this loan was opened (Q-03).
+    function getLoanLedger(uint256 loanId) external view returns (address) {
+        return _loans[loanId].ledgerAtOpen;
     }
 
     /// @notice Computes the current collateral value in USDC using a fresh oracle read.

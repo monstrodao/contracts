@@ -20,6 +20,8 @@ interface IBurnable {
 }
 
 /// @dev Minimal V3 swap router interface (PancakeSwap/Alien Base SmartRouter pattern).
+/// @dev Matches the no-deadline exactInputSingle ABI (selector 0x04e45aaf) used by AlienBase SmartRouter.
+///      Changing to a router with a different ABI requires a new splitter deployment or an adapter.
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -34,7 +36,7 @@ interface ISwapRouter {
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
-/// @dev Minimal V3 pool interface for TWAP price reading.
+/// @dev Minimal V3 pool interface for TWAP price reading and fee validation.
 interface IV3Pool {
     function observe(uint32[] calldata secondsAgos) external view returns (
         int56[] memory tickCumulatives,
@@ -42,6 +44,7 @@ interface IV3Pool {
     );
     function token0() external view returns (address);
     function token1() external view returns (address);
+    function fee() external view returns (uint24);
 }
 
 /// @title AutoBurnSplitter
@@ -61,6 +64,7 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
     error ZeroAddress();
     error InvalidPool();
     error FeeDistributorNotSet();
+    error CannotRescueBurnToken();
 
     // --- Constants ---
 
@@ -77,6 +81,7 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
         bool useVault;      // true = direct USDC transfer to vault (raises exchange rate), false = pool swap + burn
         address vault;      // vault address (only used if useVault=true, ignored for swap targets)
         address pool;       // V3 pool address for TWAP price (only used if useVault=false, ignored for vault targets)
+        uint24 poolFee;     // L-03: fee tier of pool (e.g. 3000 = 0.30%), must match pool (swap targets only)
     }
 
     // --- State ---
@@ -89,9 +94,6 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
 
     /// @notice Swap router address for pool-based burns. Configurable by owner.
     address public swapRouter;
-
-    /// @notice Pool fee tier used for swap-based burns (e.g. 3000 = 0.30%). Configurable.
-    uint24 public defaultPoolFee = 3000;
 
     /// @notice Maximum acceptable slippage for swaps in basis points (e.g. 300 = 3%).
     ///         Applied relative to the TWAP price from the pool.
@@ -110,7 +112,6 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
     event BurnsCompleted(uint256 totalUsdc);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
     event SwapRouterUpdated(address oldRouter, address newRouter);
-    event DefaultPoolFeeUpdated(uint24 oldFee, uint24 newFee);
     event MaxSlippageUpdated(uint16 oldBps, uint16 newBps);
     event TwapWindowUpdated(uint32 oldWindow, uint32 newWindow);
     event FeeDistributorUpdated(address oldDistributor, address newDistributor);
@@ -141,6 +142,9 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
                     if (targets[i].vault == address(0)) revert ZeroAddress();
                 } else {
                     if (targets[i].pool == address(0)) revert InvalidPool();
+                    if (targets[i].poolFee == 0) revert InvalidPool();
+                    // L-03: poolFee must match the pool's actual fee tier
+                    if (IV3Pool(targets[i].pool).fee() != targets[i].poolFee) revert InvalidPool();
                 }
                 activeSum += targets[i].weightBps;
             }
@@ -180,13 +184,6 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
         emit SwapRouterUpdated(old, _router);
     }
 
-    /// @notice Set the default pool fee for swaps.
-    function setDefaultPoolFee(uint24 _fee) external onlyOwner {
-        uint24 old = defaultPoolFee;
-        defaultPoolFee = _fee;
-        emit DefaultPoolFeeUpdated(old, _fee);
-    }
-
     /// @notice Set maximum slippage tolerance for swaps (in bps, e.g. 300 = 3%).
     function setMaxSlippage(uint16 _bps) external onlyOwner {
         if (_bps > uint16(BPS_DENOMINATOR)) revert InvalidBpsSum();
@@ -210,9 +207,10 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
         emit FeeDistributorUpdated(old, _feeDistributor);
     }
 
-    /// @notice Emergency rescue for stuck tokens. Cannot be used during normal operation.
+    /// @notice Emergency rescue for stuck tokens. USDC cannot be rescued (L-02).
     function rescueToken(address token, address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (token == address(USDC)) revert CannotRescueBurnToken();
         uint256 balance = IERC20(token).balanceOf(address(this));
         if (balance > 0) {
             IERC20(token).safeTransfer(to, balance);
@@ -231,10 +229,6 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
 
         uint256 balanceBefore = USDC.balanceOf(address(this));
 
-        // claim() transfers USDC here and auto-triggers executeBurns() via
-        // FeeDistributor's try/catch on IAutoExecutable(tier2Recipient).executeBurns().
-        // That inner executeBurns() call hits this contract's nonReentrant guard and
-        // reverts (caught by FeeDistributor's try/catch); burns are handled below.
         IFeeDistributorClaim(feeDistributor).claim();
 
         uint256 claimed = USDC.balanceOf(address(this)) - balanceBefore;
@@ -294,7 +288,7 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
             if (t.useVault) {
                 _executeVaultBurn(t.token, t.vault, amount);
             } else {
-                _executeSwapBurn(t.token, t.pool, amount);
+                _executeSwapBurn(t.token, t.pool, t.poolFee, amount);
             }
         }
 
@@ -400,8 +394,10 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
     ///      If the token supports burn(uint256), calls it for a real supply reduction.
     ///      Otherwise falls back to sending tokens to the dead address.
     ///      Slippage protection uses the pool's TWAP price with maxSlippageBps tolerance.
+    ///      L-03: poolFee must match the configured pool's fee tier to ensure quote and
+    ///      execution use the same pool.
     /// @notice Uses the configured swapRouter. If no router is set, this will revert.
-    function _executeSwapBurn(address token, address pool, uint256 amount) internal {
+    function _executeSwapBurn(address token, address pool, uint24 poolFee, uint256 amount) internal {
         address router = swapRouter;
         if (router == address(0)) revert ZeroAddress();
 
@@ -412,11 +408,12 @@ contract AutoBurnSplitter is Ownable, ReentrancyGuard {
         USDC.forceApprove(router, amount);
 
         // Execute swap: USDC -> token, received by this contract
+        // L-03: use poolFee from the target so quote and execution use the same pool.
         uint256 amountOut = ISwapRouter(router).exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
                 tokenIn: address(USDC),
                 tokenOut: token,
-                fee: defaultPoolFee,
+                fee: poolFee,
                 recipient: address(this),
                 amountIn: amount,
                 amountOutMinimum: minOut,
