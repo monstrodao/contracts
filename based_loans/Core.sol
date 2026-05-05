@@ -53,7 +53,7 @@ interface ILendingLedger {
     function disburseLoan(address to, uint256 amount) external;
     function settleBuybackForLender(uint256 loanId, address lender, address asset, uint256 principal, uint256 totalPayment, uint256 originalFunded) external;
     function pullBuybackPayment(address from, uint256 amount, uint256 loanId) external;
-    function writeOffPosition(uint256 loanId, address lender, address asset, uint256 amount) external;
+    function writeOffPosition(uint256 loanId, address lender, address asset) external;
 }
 
 interface IFeeDistributor {
@@ -709,10 +709,7 @@ contract BasedLoansCore is Ownable, ReentrancyGuard {
                 ILendingLedger loanLedger = ILendingLedger(loan.ledgerAtOpen);
                 for (uint256 i = 0; i < lenderCount; i++) {
                     address lender = loan.lenders[i];
-                    uint256 remainingPrincipal = loan.amounts[i] * loan.buybackRemaining / loan.buybackPrice;
-                    // Always call — Ledger uses _loanUsdcRemaining to clear exact tracked state
-                    // even when remainingPrincipal rounds to zero on partial-buyback dust.
-                    loanLedger.writeOffPosition(loanId, lender, loan.asset, remainingPrincipal);
+                    loanLedger.writeOffPosition(loanId, lender, loan.asset);
                 }
                 defaultCollateralBase[loanId] = loan.collateralRemaining;
                 loanSettled[loanId] = true;

@@ -38,8 +38,8 @@ When lender USDC is matched into a loan, the Ledger locks the exact vault-share 
 
 Two mappings track the exact shares per loan per lender:
 
-- `_loanSharesOriginal` — set at lock time, never modified. Denominator for proportional release.
-- `_loanSharesRemaining` — decremented on each settlement. Cleared on final buyback or write-off.
+- `_loanSharesOriginal` — set at lock time, never modified. Used as a non-zero integrity check; not the denominator for settlement.
+- `_loanSharesRemaining` — decremented on each settlement using the live remaining-state ratio (`remainingShares * principal / remainingUsdc`). Cleared exactly on final buyback or write-off.
 
 This prevents share-rate asymmetry when the vault appreciates between lock and unlock. Without this, re-converting USDC to shares at a higher rate could release fewer shares than were originally locked.
 

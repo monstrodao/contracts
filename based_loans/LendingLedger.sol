@@ -69,6 +69,10 @@ contract BasedLoansLendingLedger is Ownable {
     error CoreNotAuthorized();
     error ShareAccountingInvariantBroken();
     error NoPendingPayment();
+    error InvalidLoanAccounting();
+    error NothingToSettle();
+    error SettlementTooSmall();
+    error NothingToWriteOff();
 
     // =============================================================
     //                             STRUCTS
@@ -209,7 +213,7 @@ contract BasedLoansLendingLedger is Ownable {
     event Enqueued(address indexed lender, address indexed asset);
     event LiquidityLocked(address indexed lender, address indexed asset, uint256 amount);
     event LiquidityReleased(address indexed lender, address indexed asset, uint256 amount);
-    event PositionWrittenOff(address indexed lender, address indexed asset, uint256 amount);
+    event PositionWrittenOff(address indexed lender, address indexed asset, uint256 shares, uint256 usdcRelease);
     event LoanDisbursed(address indexed to, uint256 amount);
     event LoanProceedsCredited(uint256 indexed loanId, address indexed lender, uint256 amount);
     event LoanProceedsClaimed(uint256 indexed loanId, address indexed lender, uint256 amount);
@@ -916,37 +920,34 @@ contract BasedLoansLendingLedger is Ownable {
             _pendingPaymentSharesAllocated[msg.sender][loanId] = sharesAllocated + lenderActualShares;
         }
 
-        // ── Principal locked release (lock tracking — unchanged formula) ─────────
-        // Uses original share counts to maintain _loanSharesRemaining, globalLocked, and
-        // cap utilization. Economic credit uses lenderActualShares instead.
+        // ── Validate loan accounting state ──────────────────────────────────────
         uint256 originalShares = _loanSharesOriginal[msg.sender][loanId][lender];
+        if (originalShares == 0 || originalFunded == 0) revert InvalidLoanAccounting();
         uint256 remainingShares = _loanSharesRemaining[msg.sender][loanId][lender];
+        uint256 remainingUsdc = _loanUsdcRemaining[msg.sender][loanId][lender];
+        if (remainingShares == 0 && remainingUsdc == 0) revert NothingToSettle();
+        if (remainingShares == 0 || remainingUsdc == 0) revert InvalidLoanAccounting();
+
+        // ── Compute release using live remaining-state ratio ─────────────────────
+        // Uses remainingShares/remainingUsdc (not original) to prevent cumulative rounding
+        // drift across partial settlements and correctly reflect vault appreciation.
+        if (principal == 0) revert SettlementTooSmall();
         uint256 principalLockedRelease;
-        if (originalShares > 0 && originalFunded > 0) {
-            principalLockedRelease = originalShares * principal / originalFunded;
-            // Do not sweep lender-level dust during partial buybacks.
-            if (principalLockedRelease > remainingShares) principalLockedRelease = remainingShares;
+        uint256 assetRelease;
+        if (principal >= remainingUsdc) {
+            // Final settlement: sweep exact remaining state.
+            principalLockedRelease = remainingShares;
+            assetRelease = remainingUsdc;
         } else {
-            principalLockedRelease = remainingShares > 0 ? remainingShares : _usdcToShares(principal);
-        }
-        if (principalLockedRelease > _accounts[lender].globalLocked) {
-            principalLockedRelease = _accounts[lender].globalLocked;
+            principalLockedRelease = remainingShares * principal / remainingUsdc;
+            if (principalLockedRelease == 0) revert SettlementTooSmall();
+            assetRelease = principal;
         }
 
         // ── Release lock tracking ────────────────────────────────────────────────
-        _loanSharesRemaining[msg.sender][loanId][lender] -= principalLockedRelease;
-        // Use per-loan USDC remaining for cap utilization release, not `principal`.
-        // Core passes principal = funded on final buyback to clear share dust — correct for share
-        // accounting but wrong for cap utilization after partial buybacks already decremented it.
-        uint256 remainingUsdc = _loanUsdcRemaining[msg.sender][loanId][lender];
-        uint256 assetRelease;
-        if (principal >= originalFunded) {
-            // Final repayment signal: clear all remaining USDC cap exposure for this loan/lender.
-            assetRelease = remainingUsdc;
-        } else {
-            assetRelease = principal < remainingUsdc ? principal : remainingUsdc;
-        }
+        _loanSharesRemaining[msg.sender][loanId][lender] = remainingShares - principalLockedRelease;
         _loanUsdcRemaining[msg.sender][loanId][lender] = remainingUsdc - assetRelease;
+        if (principalLockedRelease > _accounts[lender].globalLocked) revert ShareAccountingInvariantBroken();
         if (assetRelease > _caps[lender][asset].utilized) revert ShareAccountingInvariantBroken();
         _accounts[lender].globalLocked -= principalLockedRelease;
         _caps[lender][asset].utilized -= assetRelease;
@@ -1019,18 +1020,15 @@ contract BasedLoansLendingLedger is Ownable {
     /// @param loanId The loan ID being written off.
     /// @param lender The lender whose position to write off.
     /// @param asset The collateral asset the liquidity was locked for.
-    /// @param amount The USDC principal amount being written off.
-    function writeOffPosition(uint256 loanId, address lender, address asset, uint256 amount) external {
+    function writeOffPosition(uint256 loanId, address lender, address asset) external {
         _onlyActiveCore();
-        uint256 remainingShares = _loanSharesRemaining[msg.sender][loanId][lender];
-        uint256 shares = remainingShares > 0 ? remainingShares : _usdcToShares(amount);
-        if (shares > _accounts[lender].globalLocked) shares = _accounts[lender].globalLocked;
-        if (shares > _accounts[lender].globalDeposit) shares = _accounts[lender].globalDeposit;
+        uint256 shares = _loanSharesRemaining[msg.sender][loanId][lender];
+        uint256 assetRelease = _loanUsdcRemaining[msg.sender][loanId][lender];
+        if (shares == 0 && assetRelease == 0) revert NothingToWriteOff();
+        if (shares == 0 || assetRelease == 0) revert InvalidLoanAccounting();
+        if (shares > _accounts[lender].globalLocked) revert ShareAccountingInvariantBroken();
+        if (shares > _accounts[lender].globalDeposit) revert ShareAccountingInvariantBroken();
         _loanSharesRemaining[msg.sender][loanId][lender] = 0;
-        // Use per-loan USDC remaining for cap utilization. `amount` from Core can
-        // floor to 0 on tiny default dust; _loanUsdcRemaining has the correct exposure to clear.
-        uint256 remainingUsdc = _loanUsdcRemaining[msg.sender][loanId][lender];
-        uint256 assetRelease = remainingUsdc > 0 ? remainingUsdc : amount;
         _loanUsdcRemaining[msg.sender][loanId][lender] = 0;
         if (assetRelease > _caps[lender][asset].utilized) revert ShareAccountingInvariantBroken();
 
@@ -1049,7 +1047,7 @@ contract BasedLoansLendingLedger is Ownable {
         if (!isQueued[asset][lender] && _hasUsableCapacity(lender, asset)) {
             _enqueue(asset, lender);
         }
-        emit PositionWrittenOff(lender, asset, amount);
+        emit PositionWrittenOff(lender, asset, shares, assetRelease);
     }
 
     // =============================================================
@@ -1107,6 +1105,8 @@ contract BasedLoansLendingLedger is Ownable {
         IERC4626 v = IERC4626(vault);
         uint256 net = v.previewRedeem(shares);
         if (net == 0) return 0;
+        // 8 iterations is sufficient for mUSDC's current 25 bps redeem fee in tested ranges.
+        // Increase this bound if integrating a vault with materially higher fees or different rounding behavior.
         for (uint256 i; i < 8 && net > 0; i++) {
             if (v.previewWithdraw(net) <= shares) return net;
             net -= 1;
