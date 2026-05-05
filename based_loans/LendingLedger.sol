@@ -106,6 +106,11 @@ contract BasedLoansLendingLedger is Ownable {
     /// @notice Maximum items per batch call (claimLoanProceeds, redeployLoanProceeds).
     uint8 public constant MAX_BATCH_SIZE = 50;
 
+    /// @notice Shares minted to address(0xdead) in the mUSDC constructor (inflation-attack seed).
+    ///         mUSDC waives the redeem fee when burning `shares` would leave only this seed.
+    ///         Mirrors mUSDC's private SEED_AMOUNT constant; safe to hardcode because mUSDC is immutable.
+    uint256 public constant MUSDC_SEED_AMOUNT = 1e6;
+
     // =============================================================
     //                     CONFIGURABLE BOUNDS
     // =============================================================
@@ -1100,17 +1105,34 @@ contract BasedLoansLendingLedger is Ownable {
     ///      round-trip check as mUSDC.maxWithdraw: decrements until previewWithdraw(net)
     ///      fits within the available shares, preventing the previewRedeem/previewWithdraw
     ///      rounding asymmetry from advertising more USDC than _unwrapFromVault can deliver.
+    ///      This function assumes the configured vault is the immutable mUSDC vault; the
+    ///      last-live-redeemer branch is mUSDC-specific and not safe to use with other ERC-4626 vaults
+    ///      that charge a redeem fee.
     function _sharesToUsdcNet(uint256 shares) internal view returns (uint256) {
         if (vault == address(0)) return shares;
+        if (shares == 0) return 0;
+
         IERC4626 v = IERC4626(vault);
+
+        // Mirror mUSDC's exact last-live-redeemer condition: if redeeming `shares` would leave
+        // only the immutable dead seed, the redeem fee is waived and convertToAssets gives the
+        // correct gross amount. Written as `supply - MUSDC_SEED_AMOUNT <= shares` (overflow-safe)
+        // rather than `shares + MUSDC_SEED_AMOUNT >= supply` to avoid addition overflow.
+        uint256 supply = IERC20(vault).totalSupply();
+        if (supply <= MUSDC_SEED_AMOUNT || supply - MUSDC_SEED_AMOUNT <= shares) {
+            return v.convertToAssets(shares);
+        }
+
         uint256 net = v.previewRedeem(shares);
         if (net == 0) return 0;
+
         // 8 iterations is sufficient for mUSDC's current 25 bps redeem fee in tested ranges.
         // Increase this bound if integrating a vault with materially higher fees or different rounding behavior.
         for (uint256 i; i < 8 && net > 0; i++) {
             if (v.previewWithdraw(net) <= shares) return net;
             net -= 1;
         }
+
         return net;
     }
 

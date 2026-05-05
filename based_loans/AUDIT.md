@@ -94,6 +94,10 @@ Deposits are tracked as shares in vault mode and raw USDC in no-vault mode. Swit
 - Constructor seeds 1 USDC to `address(0xdead)` for inflation attack mitigation.
 - `_decimalsOffset()` is not overridden and returns 0. Seed provides adequate protection.
 
+**LLR accounting alignment — LendingLedger `_sharesToUsdcNet`:**
+
+mUSDC's `previewRedeem` waives the 25 bps fee when `totalSupply() <= shares + SEED_AMOUNT` (the last-live-redeemer condition). Because mUSDC is already live and immutable, LendingLedger mirrors this exact condition in `_sharesToUsdcNet` using the overflow-safe equivalent: when `vault.totalSupply() <= MUSDC_SEED_AMOUNT || vault.totalSupply() - MUSDC_SEED_AMOUNT <= shares` (`MUSDC_SEED_AMOUNT` is a named constant equal to mUSDC's private `SEED_AMOUNT = 1e6`), the function uses `convertToAssets(shares)` (gross, no fee) rather than `previewRedeem(shares)` (fee-deducted). This prevents `_vaultDeliverable()` from undercounting redeemable USDC when LendingLedger is the sole live mUSDC holder, which would otherwise temporarily block lenders from withdrawing or claiming their full entitled amount. This logic is intentionally mUSDC-specific and assumes the configured ERC-4626 vault is the immutable mUSDC vault.
+
 ### 6. Queue Lifecycle — LendingLedger
 
 Lenders enter per-asset FIFO queues only when they have usable capacity:
