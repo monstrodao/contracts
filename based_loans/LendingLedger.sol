@@ -1114,12 +1114,15 @@ contract BasedLoansLendingLedger is Ownable {
 
         IERC4626 v = IERC4626(vault);
 
-        // Mirror mUSDC's exact last-live-redeemer condition: if redeeming `shares` would leave
-        // only the immutable dead seed, the redeem fee is waived and convertToAssets gives the
-        // correct gross amount. Written as `supply - MUSDC_SEED_AMOUNT <= shares` (overflow-safe)
-        // rather than `shares + MUSDC_SEED_AMOUNT >= supply` to avoid addition overflow.
+        // Mirror mUSDC's withdraw() last-live-redeemer condition: if LendingLedger holds all
+        // non-seed shares, mUSDC waives the redeem fee for ANY withdrawal amount (not just
+        // full-balance ones). This uses balanceOf(this), matching the owner-aware check in
+        // mUSDC.withdraw(), not the amount-based check in mUSDC.previewRedeem(). Written
+        // overflow-safe: supply - MUSDC_SEED_AMOUNT <= ledgerBalance rather than
+        // ledgerBalance + MUSDC_SEED_AMOUNT >= supply.
         uint256 supply = IERC20(vault).totalSupply();
-        if (supply <= MUSDC_SEED_AMOUNT || supply - MUSDC_SEED_AMOUNT <= shares) {
+        uint256 ledgerBalance = IERC20(vault).balanceOf(address(this));
+        if (supply <= MUSDC_SEED_AMOUNT || supply - MUSDC_SEED_AMOUNT <= ledgerBalance) {
             return v.convertToAssets(shares);
         }
 
