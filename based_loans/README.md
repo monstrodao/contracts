@@ -79,26 +79,29 @@ Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra)
 
 | Contract | Auditor | Status |
 |---|---|---|
-| Core | Hashlock | In progress |
-| LendingLedger | Hashlock | In progress |
-| AssetManager | Hashlock | In progress |
-| OracleManager | Hashlock | In progress |
-| FeeDistributor | Hashlock | In progress |
-| AutoBurnSplitter | Hashlock | In progress |
-| UniswapV3 Adapter | Hashlock | In progress |
-| Pyth Adapter | Hashlock | In progress |
-| Algebra Adapter | Hashlock | In progress |
+| Core | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| LendingLedger | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| AssetManager | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| OracleManager | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| FeeDistributor | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| AutoBurnSplitter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| UniswapV3 Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| Pyth Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| Algebra Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
 
 ## Deployments (Base Mainnet, chainId: 8453)
 
 | Contract | Address |
 |---|---|
-| Core | Pending audit completion |
-| LendingLedger | Pending audit completion |
-| AssetManager | Pending audit completion |
-| OracleManager | Pending audit completion |
-| FeeDistributor | Pending audit completion |
-| AutoBurnSplitter | Pending audit completion |
+| Core | [`0x88Df29c4c2D564A2996d99bbe3C85da505881Aa3`](https://basescan.org/address/0x88Df29c4c2D564A2996d99bbe3C85da505881Aa3) |
+| LendingLedger | [`0x278CfeaDeAaCBe88f24692ef199247cF17c5141F`](https://basescan.org/address/0x278CfeaDeAaCBe88f24692ef199247cF17c5141F) |
+| AssetManager | [`0xA93407aE856Ee3241550292B8A8B7cF8B98b1212`](https://basescan.org/address/0xA93407aE856Ee3241550292B8A8B7cF8B98b1212) |
+| OracleManager | [`0xeAbD8B03aC04Dfe8b31ADD7f0f760462FD6A8C17`](https://basescan.org/address/0xeAbD8B03aC04Dfe8b31ADD7f0f760462FD6A8C17) |
+| FeeDistributor | [`0x754D694d81C96D134cd33f3F164bb1084Df019e5`](https://basescan.org/address/0x754D694d81C96D134cd33f3F164bb1084Df019e5) |
+| AutoBurnSplitter | [`0x10cfdbed46960370b45686cf58babd67e4d656a4`](https://basescan.org/address/0x10cfdbed46960370b45686cf58babd67e4d656a4) |
+| UniswapV3 Adapter | [`0xfcDafF6e23d22d430A19aabDefDb9B2Aa2975ba2`](https://basescan.org/address/0xfcDafF6e23d22d430A19aabDefDb9B2Aa2975ba2) |
+| Algebra Adapter | [`0x218CDFd5802fF3d6a22ffB14A41C3311EBfc2908`](https://basescan.org/address/0x218CDFd5802fF3d6a22ffB14A41C3311EBfc2908) |
+| Pyth Adapter | [`0x85Ad3d6817646143e7076096D4A053ED38eFc958`](https://basescan.org/address/0x85Ad3d6817646143e7076096D4A053ED38eFc958) |
 
 ## License
 

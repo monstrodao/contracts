@@ -36,8 +36,8 @@ Key properties:
 |---|---|---|
 | MonstroToken | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
 | MonstroStaking | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
-| MonstroUSDC | Hashlock | In progress |
-| Based Loans (all contracts) | Hashlock | In progress |
+| MonstroUSDC | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| Based Loans (all contracts) | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
 
 ## Deployments (Base Mainnet, chainId: 8453)
 
@@ -45,7 +45,7 @@ Key properties:
 |---|---|
 | MonstroToken | [`0x1d3bE1CC80cA89DDbabe5b5C254AF63200e708f7`](https://basescan.org/address/0x1d3bE1CC80cA89DDbabe5b5C254AF63200e708f7) |
 | MonstroStaking | [`0x99741758A3BCD7A95B80845E124C5C499DF4742b`](https://basescan.org/address/0x99741758A3BCD7A95B80845E124C5C499DF4742b) |
-| MonstroUSDC | Pending audit completion |
+| MonstroUSDC | [`0xfA68Ac5cA298aB4B96bCE6542ec74bB9516b0397`](https://basescan.org/address/0xfA68Ac5cA298aB4B96bCE6542ec74bB9516b0397) |
 
 ## Security
 
