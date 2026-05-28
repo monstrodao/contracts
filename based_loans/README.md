@@ -52,6 +52,7 @@ For detailed contract mechanics and edge cases, see [AUDIT.md](AUDIT.md).
 | `adapters/UniswapV3.sol` | TWAP oracle for Uniswap V3 and compatible DEXes (Aerodrome, Alien Base, PancakeSwap). |
 | `adapters/Pyth.sol` | Real-time price oracle via Pyth Network. |
 | `adapters/Algebra.sol` | TWAP oracle for Algebra V2 forks (TrebleSwap, HydrexFi). |
+| `adapters/RatioDerived.sol` | Prices a token as a fixed or on-chain ratio of a base token already configured in AssetManager. Supports escrowed/discounted tokens (fixed ratio) and LST-style tokens with a live conversion rate (on-chain ratio via selector call). |
 
 ## Architecture
 
@@ -66,7 +67,7 @@ Fees → FeeDistributor → AutoBurnSplitter → mUSDC rate growth + MONSTRO bur
                        → Protocol treasury
                        → Growth incentives
 
-Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra)
+Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra, RatioDerived)
                         → AssetManager (LTV, exposure, config)
 ```
 
@@ -88,6 +89,7 @@ Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra)
 | UniswapV3 Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
 | Pyth Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
 | Algebra Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
+| RatioDerived Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Pending |
 
 ## Deployments (Base Mainnet, chainId: 8453)
 
@@ -102,6 +104,7 @@ Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra)
 | UniswapV3 Adapter | [`0xfcDafF6e23d22d430A19aabDefDb9B2Aa2975ba2`](https://basescan.org/address/0xfcDafF6e23d22d430A19aabDefDb9B2Aa2975ba2) |
 | Algebra Adapter | [`0x218CDFd5802fF3d6a22ffB14A41C3311EBfc2908`](https://basescan.org/address/0x218CDFd5802fF3d6a22ffB14A41C3311EBfc2908) |
 | Pyth Adapter | [`0x85Ad3d6817646143e7076096D4A053ED38eFc958`](https://basescan.org/address/0x85Ad3d6817646143e7076096D4A053ED38eFc958) |
+| RatioDerived Adapter | [`0xB5391e137cd3Bb9dda02c164B599c95Af0F88b52`](https://basescan.org/address/0xB5391e137cd3Bb9dda02c164B599c95Af0F88b52) |
 
 ## License
 
