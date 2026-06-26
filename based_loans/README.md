@@ -80,16 +80,16 @@ Prices → OracleManager → Adapters (Pyth, UniswapV3, Algebra, RatioDerived)
 
 | Contract | Auditor | Status |
 |---|---|---|
-| Core | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| LendingLedger | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| AssetManager | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| OracleManager | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| FeeDistributor | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| AutoBurnSplitter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| UniswapV3 Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| Pyth Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| Algebra Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Complete |
-| RatioDerived Adapter | [Hashlock](https://hashlock.com/audits/based-loans) | Pending |
+| Core | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| LendingLedger | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| AssetManager | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| OracleManager | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| FeeDistributor | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| AutoBurnSplitter | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| UniswapV3 Adapter | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| Pyth Adapter | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| Algebra Adapter | [Hashlock](https://hashlock.com/audits/monstro) | Complete |
+| RatioDerived Adapter | — | Pending |
 
 ## Deployments (Base Mainnet, chainId: 8453)
 
